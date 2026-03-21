@@ -102,9 +102,9 @@ impl ProjectLayout {
     pub(crate) fn bind(requested_path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let requested_path = requested_path.into();
         let project_root = resolve_project_root(&requested_path)?;
-        let issues_root = project_root.join(ISSUES_DIR_NAME);
-        fs::create_dir_all(&issues_root)?;
         let state_root = external_state_root(&project_root)?;
+        let issues_root = state_root.join(ISSUES_DIR_NAME);
+        fs::create_dir_all(&issues_root)?;
         fs::create_dir_all(state_root.join("mcp"))?;
         Ok(Self {
             requested_path,

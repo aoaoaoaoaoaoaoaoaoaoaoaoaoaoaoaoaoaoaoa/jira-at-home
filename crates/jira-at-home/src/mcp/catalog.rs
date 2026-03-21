@@ -47,7 +47,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "issue.save",
-        description: "Create or overwrite one issue note at `issues/<slug>.md`.",
+        description: "Create or overwrite one issue note at `issues/<slug>.md` under the bound project's external state root.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::NeverReplay,
     },
@@ -112,7 +112,7 @@ fn tool_schema(name: &str) -> Value {
             "properties": {
                 "slug": {
                     "type": "string",
-                    "description": "Stable slug. Stored at `issues/<slug>.md`."
+                    "description": "Stable slug. Stored at `issues/<slug>.md` under the bound project's external state root."
                 },
                 "body": {
                     "type": "string",

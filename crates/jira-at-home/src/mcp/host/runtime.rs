@@ -230,7 +230,7 @@ impl HostRuntime {
                     "name": SERVER_NAME,
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Bind the session with project.bind, then use issue.save to park ideas in issues/<slug>.md. issue.list enumerates every existing issue file because there is no closed state."
+                "instructions": "Bind the session with project.bind, then use issue.save to park ideas in the bound state directory under issues/<slug>.md. issue.list enumerates every existing issue file because there is no closed state."
             }))),
             "notifications/initialized" => {
                 if !self.seed_captured() {

@@ -84,7 +84,7 @@ impl WorkerService {
                     .map_err(store_fault(self.generation, &operation))?;
                 issue_save_output(
                     &receipt,
-                    self.store.layout().project_root.as_path(),
+                    self.store.layout().state_root.as_path(),
                     self.generation,
                     &operation,
                 )?
@@ -96,7 +96,7 @@ impl WorkerService {
                     .map_err(store_fault(self.generation, &operation))?;
                 issue_list_output(
                     &issues,
-                    self.store.layout().project_root.as_path(),
+                    self.store.layout().state_root.as_path(),
                     self.generation,
                     &operation,
                 )?
@@ -111,7 +111,7 @@ impl WorkerService {
                     .map_err(store_fault(self.generation, &operation))?;
                 issue_read_output(
                     &record,
-                    self.store.layout().project_root.as_path(),
+                    self.store.layout().state_root.as_path(),
                     self.generation,
                     &operation,
                 )?
@@ -189,11 +189,11 @@ fn store_fault(
 
 fn issue_save_output(
     receipt: &SaveReceipt,
-    project_root: &Path,
+    state_root: &Path,
     generation: Generation,
     operation: &str,
 ) -> Result<ToolOutput, FaultRecord> {
-    let relative_path = relative_issue_path(&receipt.path, project_root);
+    let relative_path = relative_issue_path(&receipt.path, state_root);
     let status = if receipt.created {
         "created"
     } else {
@@ -218,7 +218,7 @@ fn issue_save_output(
         [
             format!("saved issue {}", receipt.slug),
             format!("status: {status}"),
-            format!("path: {}", relative_issue_path(&receipt.path, project_root)),
+            format!("path: {}", relative_issue_path(&receipt.path, state_root)),
             format!("updated: {}", format_timestamp(receipt.updated_at)),
         ]
         .join("\n"),
@@ -232,7 +232,7 @@ fn issue_save_output(
 
 fn issue_list_output(
     issues: &[crate::store::IssueSummary],
-    project_root: &Path,
+    state_root: &Path,
     generation: Generation,
     operation: &str,
 ) -> Result<ToolOutput, FaultRecord> {
@@ -249,10 +249,8 @@ fn issue_list_output(
         .iter()
         .map(|issue| {
             let path = relative_issue_path(
-                &project_root
-                    .join("issues")
-                    .join(format!("{}.md", issue.slug)),
-                project_root,
+                &state_root.join("issues").join(format!("{}.md", issue.slug)),
+                state_root,
             );
             json!({
                 "slug": issue.slug,
@@ -277,11 +275,11 @@ fn issue_list_output(
 
 fn issue_read_output(
     record: &IssueRecord,
-    project_root: &Path,
+    state_root: &Path,
     generation: Generation,
     operation: &str,
 ) -> Result<ToolOutput, FaultRecord> {
-    let relative_path = relative_issue_path(&record.path, project_root);
+    let relative_path = relative_issue_path(&record.path, state_root);
     let concise = json!({
         "slug": record.slug,
         "updated_at": format_timestamp(record.updated_at),
@@ -303,7 +301,7 @@ fn issue_read_output(
     let full_text = Some(format!(
         "issue {}\npath: {}\nupdated: {}\nbytes: {}\n\n{}",
         record.slug,
-        relative_issue_path(&record.path, project_root),
+        relative_issue_path(&record.path, state_root),
         format_timestamp(record.updated_at),
         record.bytes,
         record.body,

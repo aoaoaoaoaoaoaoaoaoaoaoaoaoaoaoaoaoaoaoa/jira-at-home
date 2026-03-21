@@ -231,7 +231,7 @@ fn cold_start_exposes_basic_toolset_and_binding_surface() -> TestResult {
 }
 
 #[test]
-fn save_list_and_read_roundtrip_through_canonical_issue_dir() -> TestResult {
+fn save_list_and_read_roundtrip_through_state_backed_issue_dir() -> TestResult {
     let project_root = temp_project_root("roundtrip")?;
     let state_home = project_root.join("state-home");
     must(fs::create_dir_all(&state_home), "create state home")?;
@@ -263,11 +263,12 @@ fn save_list_and_read_roundtrip_through_canonical_issue_dir() -> TestResult {
         Some("issues/feral-machine.md")
     );
 
-    let saved_path = project_root.join("issues").join("feral-machine.md");
+    let saved_path = state_root.join("issues").join("feral-machine.md");
     assert_eq!(
         must(fs::read_to_string(&saved_path), "read saved issue")?,
         body
     );
+    assert!(!project_root.join("issues").exists());
 
     let list = harness.call_tool(4, "issue.list", json!({}))?;
     assert_tool_ok(&list);

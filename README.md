@@ -4,7 +4,7 @@
 
 The domain is mercilessly small:
 
-- `issues/<slug>.md` stores the actual note body
+- `~/.local/state/jira_at_home/projects/.../issues/<slug>.md` stores the actual note body
 - `issue.save` overwrites or creates one note
 - `issue.list` enumerates the existing slugs
 - `issue.read` returns the note body for one slug
@@ -15,6 +15,6 @@ The feature set stays primitive, but the transport posture is not:
 - explicit replay contracts
 - porcelain-by-default tool output
 - hot host reexec through `libmcp` session snapshots
-- append-only JSONL telemetry outside the repo under the platform state dir
+- issue bodies and append-only JSONL telemetry outside the repo under the platform state dir
 
 Use `cargo run -- mcp serve --project .` to launch it against the current repo.
