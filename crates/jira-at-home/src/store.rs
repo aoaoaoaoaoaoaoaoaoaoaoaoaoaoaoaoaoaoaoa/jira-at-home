@@ -11,7 +11,48 @@ use time::OffsetDateTime;
 pub(crate) const ISSUES_DIR_NAME: &str = "issues";
 const APP_STATE_DIR_NAME: &str = "jira_at_home";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum IssueCategory {
+    Feature,
+    Bug,
+}
+
+impl IssueCategory {
+    const ALL: [Self; 2] = [Self::Feature, Self::Bug];
+
+    pub(crate) fn parse(raw: impl Into<String>) -> Result<Self, StoreError> {
+        let raw = raw.into();
+        Self::from_dir_name(raw.as_str()).ok_or(StoreError::InvalidCategory(raw))
+    }
+
+    pub(crate) fn all() -> [Self; 2] {
+        Self::ALL
+    }
+
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Feature => "feature",
+            Self::Bug => "bug",
+        }
+    }
+
+    fn from_dir_name(raw: &str) -> Option<Self> {
+        match raw {
+            "feature" => Some(Self::Feature),
+            "bug" => Some(Self::Bug),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for IssueCategory {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(crate) struct IssueSlug(String);
 
 impl IssueSlug {
@@ -73,6 +114,28 @@ impl std::fmt::Display for IssueSlug {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) struct IssueKey {
+    pub(crate) category: IssueCategory,
+    pub(crate) slug: IssueSlug,
+}
+
+impl IssueKey {
+    pub(crate) fn new(category: IssueCategory, slug: IssueSlug) -> Self {
+        Self { category, slug }
+    }
+
+    fn from_issue_path(path: &Path, category: IssueCategory) -> Result<Self, StoreError> {
+        Ok(Self::new(category, IssueSlug::from_issue_path(path)?))
+    }
+}
+
+impl std::fmt::Display for IssueKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.category, self.slug)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct IssueBody(String);
 
@@ -105,6 +168,9 @@ impl ProjectLayout {
         let state_root = external_state_root(&project_root)?;
         let issues_root = state_root.join(ISSUES_DIR_NAME);
         fs::create_dir_all(&issues_root)?;
+        for category in IssueCategory::all() {
+            fs::create_dir_all(issues_root.join(category.as_str()))?;
+        }
         fs::create_dir_all(state_root.join("mcp"))?;
         Ok(Self {
             requested_path,
@@ -114,8 +180,13 @@ impl ProjectLayout {
         })
     }
 
-    pub(crate) fn issue_path(&self, slug: &IssueSlug) -> PathBuf {
-        self.issues_root.join(format!("{slug}.md"))
+    pub(crate) fn issue_category_root(&self, category: IssueCategory) -> PathBuf {
+        self.issues_root.join(category.as_str())
+    }
+
+    pub(crate) fn issue_path(&self, key: &IssueKey) -> PathBuf {
+        self.issue_category_root(key.category)
+            .join(format!("{}.md", key.slug))
     }
 }
 
@@ -126,13 +197,14 @@ pub(crate) struct ProjectStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct IssueSummary {
-    pub(crate) slug: IssueSlug,
+    pub(crate) key: IssueKey,
+    pub(crate) path: PathBuf,
     pub(crate) updated_at: OffsetDateTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct IssueRecord {
-    pub(crate) slug: IssueSlug,
+    pub(crate) key: IssueKey,
     pub(crate) body: String,
     pub(crate) path: PathBuf,
     pub(crate) updated_at: OffsetDateTime,
@@ -141,10 +213,18 @@ pub(crate) struct IssueRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SaveReceipt {
-    pub(crate) slug: IssueSlug,
+    pub(crate) key: IssueKey,
     pub(crate) path: PathBuf,
     pub(crate) created: bool,
     pub(crate) updated_at: OffsetDateTime,
+    pub(crate) bytes: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct DeleteReceipt {
+    pub(crate) key: IssueKey,
+    pub(crate) path: PathBuf,
+    pub(crate) deleted_at: OffsetDateTime,
     pub(crate) bytes: usize,
 }
 
@@ -170,14 +250,14 @@ impl IssueStore {
         })
     }
 
-    pub(crate) fn save(&self, slug: IssueSlug, body: IssueBody) -> Result<SaveReceipt, StoreError> {
-        let path = self.layout.issue_path(&slug);
+    pub(crate) fn save(&self, key: IssueKey, body: IssueBody) -> Result<SaveReceipt, StoreError> {
+        let path = self.layout.issue_path(&key);
         let created = !path.exists();
         let body = body.into_inner();
         fs::write(&path, body.as_bytes())?;
         let metadata = fs::metadata(&path)?;
         Ok(SaveReceipt {
-            slug,
+            key,
             path,
             created,
             updated_at: metadata_modified_at(&metadata.modified()?),
@@ -186,36 +266,90 @@ impl IssueStore {
     }
 
     pub(crate) fn list(&self) -> Result<Vec<IssueSummary>, StoreError> {
+        self.enforce_issue_root_shape()?;
         let mut issues = Vec::new();
-        for entry in fs::read_dir(&self.layout.issues_root)? {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            if !file_type.is_file() {
-                continue;
+        for category in IssueCategory::all() {
+            for entry in fs::read_dir(self.layout.issue_category_root(category))? {
+                let entry = entry?;
+                let path = entry.path();
+                let file_type = entry.file_type()?;
+                if !file_type.is_file() {
+                    return Err(StoreError::MalformedIssueEntry(
+                        path.display().to_string(),
+                        "issue category directory may contain only `.md` files".to_owned(),
+                    ));
+                }
+                let key = IssueKey::from_issue_path(&path, category)?;
+                let updated_at = metadata_modified_at(&entry.metadata()?.modified()?);
+                issues.push(IssueSummary {
+                    key,
+                    path,
+                    updated_at,
+                });
             }
-            let slug = IssueSlug::from_issue_path(&path)?;
-            let updated_at = metadata_modified_at(&entry.metadata()?.modified()?);
-            issues.push(IssueSummary { slug, updated_at });
         }
-        issues.sort_by(|left, right| left.slug.as_str().cmp(right.slug.as_str()));
+        issues.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(issues)
     }
 
-    pub(crate) fn read(&self, slug: IssueSlug) -> Result<IssueRecord, StoreError> {
-        let path = self.layout.issue_path(&slug);
+    pub(crate) fn read(&self, key: IssueKey) -> Result<IssueRecord, StoreError> {
+        let path = self.layout.issue_path(&key);
         if !path.is_file() {
-            return Err(StoreError::IssueNotFound(slug.to_string()));
+            return Err(StoreError::IssueNotFound(key.to_string()));
         }
         let body = fs::read_to_string(&path)?;
         let metadata = fs::metadata(&path)?;
         Ok(IssueRecord {
-            slug,
+            key,
             bytes: body.len(),
             body,
             path,
             updated_at: metadata_modified_at(&metadata.modified()?),
         })
+    }
+
+    pub(crate) fn delete(&self, key: IssueKey) -> Result<DeleteReceipt, StoreError> {
+        let path = self.layout.issue_path(&key);
+        if !path.is_file() {
+            return Err(StoreError::IssueNotFound(key.to_string()));
+        }
+        let metadata = fs::metadata(&path)?;
+        let bytes = metadata.len() as usize;
+        fs::remove_file(&path)?;
+        Ok(DeleteReceipt {
+            key,
+            path,
+            deleted_at: OffsetDateTime::now_utc(),
+            bytes,
+        })
+    }
+
+    fn enforce_issue_root_shape(&self) -> Result<(), StoreError> {
+        for entry in fs::read_dir(&self.layout.issues_root)? {
+            let entry = entry?;
+            let path = entry.path();
+            let file_type = entry.file_type()?;
+            if !file_type.is_dir() {
+                return Err(StoreError::MalformedIssueEntry(
+                    path.display().to_string(),
+                    "issue root may contain only category directories".to_owned(),
+                ));
+            }
+            let category_name = entry.file_name();
+            let category_name = category_name.to_str().ok_or_else(|| {
+                StoreError::MalformedIssueEntry(
+                    path.display().to_string(),
+                    "issue category directory name must be valid UTF-8".to_owned(),
+                )
+            })?;
+            if IssueCategory::from_dir_name(category_name).is_none() {
+                return Err(StoreError::MalformedIssueEntry(
+                    path.display().to_string(),
+                    format!("unknown issue category directory `{category_name}`"),
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -225,6 +359,8 @@ pub(crate) enum StoreError {
     MissingProjectPath(String),
     #[error("project path `{0}` does not resolve to a directory")]
     ProjectPathNotDirectory(String),
+    #[error("invalid issue category `{0}`; expected `feature` or `bug`")]
+    InvalidCategory(String),
     #[error("invalid issue slug: {0}")]
     InvalidSlug(String),
     #[error("issue body must not be blank")]

@@ -10,7 +10,8 @@ use crate::mcp::output::{
     ToolOutput, fallback_detailed_tool_output, split_presentation, tool_success,
 };
 use crate::store::{
-    IssueBody, IssueRecord, IssueSlug, IssueStore, SaveReceipt, StoreError, format_timestamp,
+    DeleteReceipt, IssueBody, IssueCategory, IssueKey, IssueRecord, IssueSlug, IssueStore,
+    SaveReceipt, StoreError, format_timestamp,
 };
 
 pub(crate) fn run_worker(
@@ -74,15 +75,30 @@ impl WorkerService {
         let output = match name {
             "issue.save" => {
                 let args = deserialize::<IssueSaveArgs>(arguments, &operation, self.generation)?;
-                let slug = IssueSlug::parse(args.slug)
+                let key = parse_key(args.category, args.slug)
                     .map_err(store_fault(self.generation, &operation))?;
                 let body = IssueBody::parse(args.body)
                     .map_err(store_fault(self.generation, &operation))?;
                 let receipt = self
                     .store
-                    .save(slug, body)
+                    .save(key, body)
                     .map_err(store_fault(self.generation, &operation))?;
                 issue_save_output(
+                    &receipt,
+                    self.store.layout().state_root.as_path(),
+                    self.generation,
+                    &operation,
+                )?
+            }
+            "issue.delete" => {
+                let args = deserialize::<IssueKeyArgs>(arguments, &operation, self.generation)?;
+                let key = parse_key(args.category, args.slug)
+                    .map_err(store_fault(self.generation, &operation))?;
+                let receipt = self
+                    .store
+                    .delete(key)
+                    .map_err(store_fault(self.generation, &operation))?;
+                issue_delete_output(
                     &receipt,
                     self.store.layout().state_root.as_path(),
                     self.generation,
@@ -102,12 +118,12 @@ impl WorkerService {
                 )?
             }
             "issue.read" => {
-                let args = deserialize::<IssueReadArgs>(arguments, &operation, self.generation)?;
-                let slug = IssueSlug::parse(args.slug)
+                let args = deserialize::<IssueKeyArgs>(arguments, &operation, self.generation)?;
+                let key = parse_key(args.category, args.slug)
                     .map_err(store_fault(self.generation, &operation))?;
                 let record = self
                     .store
-                    .read(slug)
+                    .read(key)
                     .map_err(store_fault(self.generation, &operation))?;
                 issue_read_output(
                     &record,
@@ -137,12 +153,14 @@ impl WorkerService {
 
 #[derive(Debug, Deserialize)]
 struct IssueSaveArgs {
+    category: String,
     slug: String,
     body: String,
 }
 
 #[derive(Debug, Deserialize)]
-struct IssueReadArgs {
+struct IssueKeyArgs {
+    category: String,
     slug: String,
 }
 
@@ -161,6 +179,13 @@ fn deserialize<T: for<'de> Deserialize<'de>>(
     })
 }
 
+fn parse_key(category: String, slug: String) -> Result<IssueKey, StoreError> {
+    Ok(IssueKey::new(
+        IssueCategory::parse(category)?,
+        IssueSlug::parse(slug)?,
+    ))
+}
+
 fn store_fault(
     generation: Generation,
     operation: &str,
@@ -172,7 +197,8 @@ fn store_fault(
             FaultStage::Worker
         };
         match error {
-            StoreError::InvalidSlug(_)
+            StoreError::InvalidCategory(_)
+            | StoreError::InvalidSlug(_)
             | StoreError::EmptyIssueBody
             | StoreError::IssueNotFound(_)
             | StoreError::MalformedIssueEntry(_, _)
@@ -200,13 +226,15 @@ fn issue_save_output(
         "updated"
     };
     let concise = json!({
-        "slug": receipt.slug,
+        "category": receipt.key.category,
+        "slug": receipt.key.slug,
         "status": status,
         "path": relative_path,
         "updated_at": format_timestamp(receipt.updated_at),
     });
     let full = json!({
-        "slug": receipt.slug,
+        "category": receipt.key.category,
+        "slug": receipt.key.slug,
         "status": status,
         "path": relative_path,
         "updated_at": format_timestamp(receipt.updated_at),
@@ -216,10 +244,50 @@ fn issue_save_output(
         &concise,
         &full,
         [
-            format!("saved issue {}", receipt.slug),
+            format!("saved issue {}", receipt.key),
             format!("status: {status}"),
             format!("path: {}", relative_issue_path(&receipt.path, state_root)),
             format!("updated: {}", format_timestamp(receipt.updated_at)),
+        ]
+        .join("\n"),
+        None,
+        SurfaceKind::Mutation,
+        generation,
+        FaultStage::Worker,
+        operation,
+    )
+}
+
+fn issue_delete_output(
+    receipt: &DeleteReceipt,
+    state_root: &Path,
+    generation: Generation,
+    operation: &str,
+) -> Result<ToolOutput, FaultRecord> {
+    let relative_path = relative_issue_path(&receipt.path, state_root);
+    let deleted_at = format_timestamp(receipt.deleted_at);
+    let concise = json!({
+        "category": receipt.key.category,
+        "slug": receipt.key.slug,
+        "status": "deleted",
+        "path": relative_path,
+        "deleted_at": deleted_at.clone(),
+    });
+    let full = json!({
+        "category": receipt.key.category,
+        "slug": receipt.key.slug,
+        "status": "deleted",
+        "path": relative_issue_path(&receipt.path, state_root),
+        "deleted_at": format_timestamp(receipt.deleted_at),
+        "bytes": receipt.bytes,
+    });
+    fallback_detailed_tool_output(
+        &concise,
+        &full,
+        [
+            format!("deleted issue {}", receipt.key),
+            format!("path: {}", relative_issue_path(&receipt.path, state_root)),
+            format!("deleted: {deleted_at}"),
         ]
         .join("\n"),
         None,
@@ -240,7 +308,8 @@ fn issue_list_output(
         .iter()
         .map(|issue| {
             json!({
-                "slug": issue.slug,
+                "category": issue.key.category,
+                "slug": issue.key.slug,
                 "updated_at": format_timestamp(issue.updated_at),
             })
         })
@@ -248,19 +317,16 @@ fn issue_list_output(
     let full_items = issues
         .iter()
         .map(|issue| {
-            let path = relative_issue_path(
-                &state_root.join("issues").join(format!("{}.md", issue.slug)),
-                state_root,
-            );
             json!({
-                "slug": issue.slug,
-                "path": path,
+                "category": issue.key.category,
+                "slug": issue.key.slug,
+                "path": relative_issue_path(&issue.path, state_root),
                 "updated_at": format_timestamp(issue.updated_at),
             })
         })
         .collect::<Vec<_>>();
     let mut lines = vec![format!("{} issue(s)", issues.len())];
-    lines.extend(issues.iter().map(|issue| issue.slug.to_string()));
+    lines.extend(issues.iter().map(|issue| issue.key.to_string()));
     fallback_detailed_tool_output(
         &json!({ "count": issues.len(), "issues": concise_items }),
         &json!({ "count": issues.len(), "issues": full_items }),
@@ -281,12 +347,14 @@ fn issue_read_output(
 ) -> Result<ToolOutput, FaultRecord> {
     let relative_path = relative_issue_path(&record.path, state_root);
     let concise = json!({
-        "slug": record.slug,
+        "category": record.key.category,
+        "slug": record.key.slug,
         "updated_at": format_timestamp(record.updated_at),
         "body": record.body,
     });
     let full = json!({
-        "slug": record.slug,
+        "category": record.key.category,
+        "slug": record.key.slug,
         "path": relative_path,
         "updated_at": format_timestamp(record.updated_at),
         "bytes": record.bytes,
@@ -294,13 +362,13 @@ fn issue_read_output(
     });
     let concise_text = format!(
         "issue {}\nupdated: {}\n\n{}",
-        record.slug,
+        record.key,
         format_timestamp(record.updated_at),
         record.body,
     );
     let full_text = Some(format!(
         "issue {}\npath: {}\nupdated: {}\nbytes: {}\n\n{}",
-        record.slug,
+        record.key,
         relative_issue_path(&record.path, state_root),
         format_timestamp(record.updated_at),
         record.bytes,

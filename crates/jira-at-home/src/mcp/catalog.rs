@@ -47,19 +47,25 @@ const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "issue.save",
-        description: "Create or overwrite one issue note at `issues/<slug>.md` under the bound project's external state root.",
+        description: "Create or overwrite one categorized issue note at `issues/<category>/<slug>.md` under the bound project's external state root.",
+        dispatch: DispatchTarget::Worker,
+        replay: ReplayContract::NeverReplay,
+    },
+    ToolSpec {
+        name: "issue.delete",
+        description: "Delete one issue note by category and slug from the bound project's external state root.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::NeverReplay,
     },
     ToolSpec {
         name: "issue.list",
-        description: "List the currently open issues. There is no close state; all existing issue files are open.",
+        description: "List the currently parked issues across the closed category set `feature | bug`. There is no close state; deleting an issue removes its file entirely.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::Convergent,
     },
     ToolSpec {
         name: "issue.read",
-        description: "Read one issue note by slug.",
+        description: "Read one issue note by category and slug.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::Convergent,
     },
@@ -110,30 +116,55 @@ fn tool_schema(name: &str) -> Value {
         "issue.save" => with_common_presentation(json!({
             "type": "object",
             "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "Mandatory issue category.",
+                    "enum": ["feature", "bug"]
+                },
                 "slug": {
                     "type": "string",
-                    "description": "Stable slug. Stored at `issues/<slug>.md` under the bound project's external state root."
+                    "description": "Stable slug. Stored at `issues/<category>/<slug>.md` under the bound project's external state root."
                 },
                 "body": {
                     "type": "string",
                     "description": "Freeform issue body. Markdown is fine."
                 }
             },
-            "required": ["slug", "body"]
+            "required": ["category", "slug", "body"]
         })),
-        "issue.list" | "system.health" | "system.telemetry" => with_common_presentation(json!({
+        "issue.delete" => with_common_presentation(json!({
             "type": "object",
-            "properties": {}
+            "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "Mandatory issue category.",
+                    "enum": ["feature", "bug"]
+                },
+                "slug": {
+                    "type": "string",
+                    "description": "Issue slug to delete within the selected category."
+                }
+            },
+            "required": ["category", "slug"]
         })),
         "issue.read" => with_common_presentation(json!({
             "type": "object",
             "properties": {
+                "category": {
+                    "type": "string",
+                    "description": "Mandatory issue category.",
+                    "enum": ["feature", "bug"]
+                },
                 "slug": {
                     "type": "string",
-                    "description": "Issue slug to read."
+                    "description": "Issue slug to read within the selected category."
                 }
             },
-            "required": ["slug"]
+            "required": ["category", "slug"]
+        })),
+        "issue.list" | "system.health" | "system.telemetry" => with_common_presentation(json!({
+            "type": "object",
+            "properties": {}
         })),
         _ => Value::Null,
     }

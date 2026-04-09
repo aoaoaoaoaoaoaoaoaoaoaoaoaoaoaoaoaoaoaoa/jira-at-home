@@ -4,10 +4,12 @@
 
 The domain is mercilessly small:
 
-- `~/.local/state/jira_at_home/projects/.../issues/<slug>.md` stores the actual note body
-- `issue.save` overwrites or creates one note
-- `issue.list` enumerates the existing slugs
-- `issue.read` returns the note body for one slug
+- `~/.local/state/jira_at_home/projects/.../issues/<category>/<slug>.md` stores the actual note body
+- every issue has a mandatory closed-world category: `feature` or `bug`
+- `issue.save` overwrites or creates one categorized note
+- `issue.delete` removes one note entirely
+- `issue.list` enumerates the existing categorized slugs
+- `issue.read` returns the note body for one categorized issue
 
 The feature set stays primitive, but the transport posture is not:
 

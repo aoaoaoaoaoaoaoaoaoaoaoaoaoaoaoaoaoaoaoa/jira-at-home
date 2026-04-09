@@ -170,7 +170,19 @@ fn assert_tool_ok(response: &Value) {
     );
 }
 
+fn assert_tool_error(response: &Value) {
+    assert_eq!(
+        response["result"]["isError"].as_bool(),
+        Some(true),
+        "tool response unexpectedly succeeded: {response:#}"
+    );
+}
+
 fn tool_content(response: &Value) -> &Value {
+    &response["result"]["structuredContent"]
+}
+
+fn tool_fault(response: &Value) -> &Value {
     &response["result"]["structuredContent"]
 }
 
@@ -181,6 +193,15 @@ fn tool_names(response: &Value) -> Vec<&str> {
         .flatten()
         .filter_map(|tool| tool["name"].as_str())
         .collect()
+}
+
+fn tool_definition<'a>(response: &'a Value, name: &str) -> &'a Value {
+    response["result"]["tools"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|tool| tool["name"].as_str() == Some(name))
+        .expect("missing tool definition")
 }
 
 #[test]
@@ -201,10 +222,33 @@ fn cold_start_exposes_basic_toolset_and_binding_surface() -> TestResult {
     let tool_names = tool_names(&tools);
     assert!(tool_names.contains(&"project.bind"));
     assert!(tool_names.contains(&"issue.save"));
+    assert!(tool_names.contains(&"issue.delete"));
     assert!(tool_names.contains(&"issue.list"));
     assert!(tool_names.contains(&"issue.read"));
     assert!(tool_names.contains(&"system.health"));
     assert!(tool_names.contains(&"system.telemetry"));
+    let save_schema = &tool_definition(&tools, "issue.save")["inputSchema"];
+    assert_eq!(
+        save_schema["properties"]["category"]["enum"],
+        json!(["feature", "bug"])
+    );
+    assert!(
+        save_schema["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("category")))
+    );
+    let read_schema = &tool_definition(&tools, "issue.read")["inputSchema"];
+    assert!(
+        read_schema["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("category")))
+    );
+    let delete_schema = &tool_definition(&tools, "issue.delete")["inputSchema"];
+    assert!(
+        delete_schema["required"]
+            .as_array()
+            .is_some_and(|required| required.contains(&json!("category")))
+    );
 
     let health = harness.call_tool(3, "system.health", json!({}))?;
     assert_tool_ok(&health);
@@ -231,7 +275,7 @@ fn cold_start_exposes_basic_toolset_and_binding_surface() -> TestResult {
 }
 
 #[test]
-fn save_list_and_read_roundtrip_through_state_backed_issue_dir() -> TestResult {
+fn save_read_delete_roundtrip_through_state_backed_issue_dir() -> TestResult {
     let project_root = temp_project_root("roundtrip")?;
     let state_home = project_root.join("state-home");
     must(fs::create_dir_all(&state_home), "create state home")?;
@@ -253,17 +297,22 @@ fn save_list_and_read_roundtrip_through_state_backed_issue_dir() -> TestResult {
         3,
         "issue.save",
         json!({
+            "category": "feature",
             "slug": "feral-machine",
             "body": body,
         }),
     )?;
     assert_tool_ok(&save);
+    assert_eq!(tool_content(&save)["category"].as_str(), Some("feature"));
     assert_eq!(
         tool_content(&save)["path"].as_str(),
-        Some("issues/feral-machine.md")
+        Some("issues/feature/feral-machine.md")
     );
 
-    let saved_path = state_root.join("issues").join("feral-machine.md");
+    let saved_path = state_root
+        .join("issues")
+        .join("feature")
+        .join("feral-machine.md");
     assert_eq!(
         must(fs::read_to_string(&saved_path), "read saved issue")?,
         body
@@ -277,20 +326,70 @@ fn save_list_and_read_roundtrip_through_state_backed_issue_dir() -> TestResult {
         tool_content(&list)["issues"][0]["slug"].as_str(),
         Some("feral-machine")
     );
+    assert_eq!(
+        tool_content(&list)["issues"][0]["category"].as_str(),
+        Some("feature")
+    );
     assert!(tool_content(&list)["issues"][0].get("body").is_none());
 
     let read = harness.call_tool_full(
         5,
         "issue.read",
         json!({
+            "category": "feature",
             "slug": "feral-machine",
         }),
     )?;
     assert_tool_ok(&read);
+    assert_eq!(tool_content(&read)["category"].as_str(), Some("feature"));
     assert_eq!(tool_content(&read)["body"].as_str(), Some(body));
     assert_eq!(
         tool_content(&read)["path"].as_str(),
-        Some("issues/feral-machine.md")
+        Some("issues/feature/feral-machine.md")
+    );
+
+    let delete = harness.call_tool_full(
+        6,
+        "issue.delete",
+        json!({
+            "category": "feature",
+            "slug": "feral-machine",
+        }),
+    )?;
+    assert_tool_ok(&delete);
+    assert_eq!(tool_content(&delete)["category"].as_str(), Some("feature"));
+    assert_eq!(tool_content(&delete)["status"].as_str(), Some("deleted"));
+    assert_eq!(
+        tool_content(&delete)["path"].as_str(),
+        Some("issues/feature/feral-machine.md")
+    );
+    assert_eq!(
+        tool_content(&delete)["bytes"].as_u64(),
+        Some(body.len() as u64)
+    );
+    assert!(!saved_path.exists());
+
+    let drained = harness.call_tool(7, "issue.list", json!({}))?;
+    assert_tool_ok(&drained);
+    assert_eq!(tool_content(&drained)["count"].as_u64(), Some(0));
+
+    let missing = harness.call_tool(
+        8,
+        "issue.read",
+        json!({
+            "category": "feature",
+            "slug": "feral-machine",
+        }),
+    )?;
+    assert_tool_error(&missing);
+    assert_eq!(
+        tool_fault(&missing)["fault"]["code"].as_str(),
+        Some("invalid_input")
+    );
+    assert!(
+        tool_fault(&missing)["fault"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("feature/feral-machine"))
     );
 
     let telemetry_path = state_root.join("mcp").join("telemetry.jsonl");
@@ -307,8 +406,58 @@ fn save_list_and_read_roundtrip_through_state_backed_issue_dir() -> TestResult {
     assert!(
         events
             .iter()
+            .any(|event| event["event"] == "tool_call" && event["tool_name"] == "issue.delete"),
+        "expected issue.delete tool_call event: {events:#?}"
+    );
+    assert!(
+        events
+            .iter()
             .any(|event| event["event"] == "hot_paths_snapshot"),
         "expected hot_paths_snapshot event: {events:#?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn issue_category_is_closed_and_mandatory() -> TestResult {
+    let project_root = temp_project_root("category_contract")?;
+    let state_home = project_root.join("state-home");
+    must(fs::create_dir_all(&state_home), "create state home")?;
+    let mut harness = McpHarness::spawn(None, &state_home, &[])?;
+    let _ = harness.initialize()?;
+    harness.notify_initialized()?;
+    let bind = harness.bind_project(2, &project_root)?;
+    assert_tool_ok(&bind);
+
+    let missing_category = harness.call_tool(
+        3,
+        "issue.save",
+        json!({
+            "slug": "missing-category",
+            "body": "body",
+        }),
+    )?;
+    assert_tool_error(&missing_category);
+    assert!(
+        tool_fault(&missing_category)["fault"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("missing field `category`"))
+    );
+
+    let invalid_category = harness.call_tool(
+        4,
+        "issue.save",
+        json!({
+            "category": "chore",
+            "slug": "wrong-category",
+            "body": "body",
+        }),
+    )?;
+    assert_tool_error(&invalid_category);
+    assert!(
+        tool_fault(&invalid_category)["fault"]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("expected `feature` or `bug`"))
     );
     Ok(())
 }
@@ -333,6 +482,7 @@ fn convergent_issue_list_survives_worker_crash() -> TestResult {
         2,
         "issue.save",
         json!({
+            "category": "bug",
             "slug": "one-shot",
             "body": "body",
         }),
@@ -377,6 +527,7 @@ fn host_rollout_reexec_preserves_session_and_binding() -> TestResult {
         2,
         "issue.save",
         json!({
+            "category": "feature",
             "slug": "after-rollout",
             "body": "body",
         }),
@@ -395,6 +546,7 @@ fn host_rollout_reexec_preserves_session_and_binding() -> TestResult {
         5,
         "issue.read",
         json!({
+            "category": "feature",
             "slug": "after-rollout",
         }),
     )?;
