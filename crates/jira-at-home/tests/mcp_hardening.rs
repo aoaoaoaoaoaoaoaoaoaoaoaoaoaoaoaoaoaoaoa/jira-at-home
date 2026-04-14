@@ -195,13 +195,13 @@ fn tool_names(response: &Value) -> Vec<&str> {
         .collect()
 }
 
-fn tool_definition<'a>(response: &'a Value, name: &str) -> &'a Value {
+fn tool_definition<'a>(response: &'a Value, name: &str) -> TestResult<&'a Value> {
     response["result"]["tools"]
         .as_array()
         .into_iter()
         .flatten()
         .find(|tool| tool["name"].as_str() == Some(name))
-        .expect("missing tool definition")
+        .ok_or_else(|| io::Error::other(format!("missing tool definition `{name}`")).into())
 }
 
 #[test]
@@ -227,7 +227,7 @@ fn cold_start_exposes_basic_toolset_and_binding_surface() -> TestResult {
     assert!(tool_names.contains(&"issue.read"));
     assert!(tool_names.contains(&"system.health"));
     assert!(tool_names.contains(&"system.telemetry"));
-    let save_schema = &tool_definition(&tools, "issue.save")["inputSchema"];
+    let save_schema = &tool_definition(&tools, "issue.save")?["inputSchema"];
     assert_eq!(
         save_schema["properties"]["category"]["enum"],
         json!(["feature", "bug"])
@@ -237,13 +237,13 @@ fn cold_start_exposes_basic_toolset_and_binding_surface() -> TestResult {
             .as_array()
             .is_some_and(|required| required.contains(&json!("category")))
     );
-    let read_schema = &tool_definition(&tools, "issue.read")["inputSchema"];
+    let read_schema = &tool_definition(&tools, "issue.read")?["inputSchema"];
     assert!(
         read_schema["required"]
             .as_array()
             .is_some_and(|required| required.contains(&json!("category")))
     );
-    let delete_schema = &tool_definition(&tools, "issue.delete")["inputSchema"];
+    let delete_schema = &tool_definition(&tools, "issue.delete")?["inputSchema"];
     assert!(
         delete_schema["required"]
             .as_array()
@@ -415,6 +415,39 @@ fn save_read_delete_roundtrip_through_state_backed_issue_dir() -> TestResult {
             .any(|event| event["event"] == "hot_paths_snapshot"),
         "expected hot_paths_snapshot event: {events:#?}"
     );
+    Ok(())
+}
+
+#[test]
+fn legacy_uncategorized_issue_files_do_not_poison_binding() -> TestResult {
+    let project_root = temp_project_root("legacy_uncategorized")?;
+    let state_home = project_root.join("state-home");
+    must(fs::create_dir_all(&state_home), "create state home")?;
+    let mut harness = McpHarness::spawn(None, &state_home, &[])?;
+    let _ = harness.initialize()?;
+    harness.notify_initialized()?;
+
+    let bind = harness.bind_project(2, &project_root)?;
+    assert_tool_ok(&bind);
+    let state_root = must_some(
+        tool_content(&bind)["state_root"]
+            .as_str()
+            .map(PathBuf::from),
+        "state root in bind response",
+    )?;
+    let legacy_path = state_root.join("issues").join("legacy-root-file.md");
+    must(
+        fs::write(&legacy_path, "old uncategorized body"),
+        "write legacy root issue",
+    )?;
+
+    let rebound = harness.bind_project(3, &project_root)?;
+    assert_tool_ok(&rebound);
+    assert_eq!(tool_content(&rebound)["issue_count"].as_u64(), Some(0));
+
+    let list = harness.call_tool(4, "issue.list", json!({}))?;
+    assert_tool_ok(&list);
+    assert_eq!(tool_content(&list)["count"].as_u64(), Some(0));
     Ok(())
 }
 

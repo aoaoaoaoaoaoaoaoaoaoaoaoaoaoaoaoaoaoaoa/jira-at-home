@@ -266,7 +266,6 @@ impl IssueStore {
     }
 
     pub(crate) fn list(&self) -> Result<Vec<IssueSummary>, StoreError> {
-        self.enforce_issue_root_shape()?;
         let mut issues = Vec::new();
         for category in IssueCategory::all() {
             for entry in fs::read_dir(self.layout.issue_category_root(category))? {
@@ -322,34 +321,6 @@ impl IssueStore {
             deleted_at: OffsetDateTime::now_utc(),
             bytes,
         })
-    }
-
-    fn enforce_issue_root_shape(&self) -> Result<(), StoreError> {
-        for entry in fs::read_dir(&self.layout.issues_root)? {
-            let entry = entry?;
-            let path = entry.path();
-            let file_type = entry.file_type()?;
-            if !file_type.is_dir() {
-                return Err(StoreError::MalformedIssueEntry(
-                    path.display().to_string(),
-                    "issue root may contain only category directories".to_owned(),
-                ));
-            }
-            let category_name = entry.file_name();
-            let category_name = category_name.to_str().ok_or_else(|| {
-                StoreError::MalformedIssueEntry(
-                    path.display().to_string(),
-                    "issue category directory name must be valid UTF-8".to_owned(),
-                )
-            })?;
-            if IssueCategory::from_dir_name(category_name).is_none() {
-                return Err(StoreError::MalformedIssueEntry(
-                    path.display().to_string(),
-                    format!("unknown issue category directory `{category_name}`"),
-                ));
-            }
-        }
-        Ok(())
     }
 }
 
