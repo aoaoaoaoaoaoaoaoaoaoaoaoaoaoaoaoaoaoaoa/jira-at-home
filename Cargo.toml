@@ -4,19 +4,19 @@ resolver = "3"
 
 [workspace.package]
 categories = ["development-tools", "command-line-utilities"]
-description = "Brutally basic per-project issue notebook MCP."
+description = "drooling, braindead issue tracking MCP"
 edition = "2024"
 keywords = ["mcp", "issues", "notes", "git", "project"]
 license = "MIT"
 readme = "README.md"
-repository = "https://git.swarm.moe/jira_at_home.git"
+repository = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/jira-at-home"
 rust-version = "1.94"
 version = "0.1.0"
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6"
-libmcp = { git = "https://git.swarm.moe/libmcp.git", rev = "bb92a05eb5446e07c6288e266bd06d7b5899eee5" }
+libmcp = { git = "https://git.swarm.moe/libmcp.git", rev = "e325cd23f19378f543981071673c1d03be438fa5" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"

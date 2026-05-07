@@ -1,22 +1,34 @@
-# jira_at_home
+# jira-at-home
 
-`jira_at_home` is an intentionally tiny MCP for parking project-local ideas.
+drooling, braindead issue tracking MCP.
 
-The domain is mercilessly small:
+No workflow. No status. No ceremony.
 
-- `~/.local/state/jira_at_home/projects/.../issues/<category>/<slug>.md` stores the actual note body
-- every issue has a mandatory closed-world category: `feature` or `bug`
-- `issue.save` overwrites or creates one categorized note
-- `issue.delete` removes one note entirely
-- `issue.list` enumerates the existing categorized slugs
-- `issue.read` returns the note body for one categorized issue
+It parks Markdown outside the repo:
 
-The feature set stays primitive, but the transport posture is not:
+```text
+~/.local/state/jira_at_home/projects/.../issues/<feature|bug>/<slug>.md
+```
 
-- durable stdio host with a disposable worker
-- explicit replay contracts
-- porcelain-by-default tool output
-- hot host reexec through `libmcp` session snapshots
-- issue bodies and append-only JSONL telemetry outside the repo under the platform state dir
+Tools:
 
-Use `cargo run -- mcp serve --project .` to launch it against the current repo.
+- `project.bind`
+- `issue.save`
+- `issue.read`
+- `issue.list`
+- `issue.delete`
+- `system.health`
+- `system.telemetry`
+
+Rules:
+
+- every issue is `feature` or `bug`
+- category is mandatory
+- delete means obliterate
+- legacy root files under `issues/*.md` are ignored
+
+Run:
+
+```bash
+cargo run -- mcp serve --project .
+```

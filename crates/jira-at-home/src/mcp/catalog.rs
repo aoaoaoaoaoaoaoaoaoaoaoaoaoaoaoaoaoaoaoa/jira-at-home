@@ -1,7 +1,8 @@
 use libmcp::ReplayContract;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::mcp::output::with_common_presentation;
+use crate::store::IssueCategory;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DispatchTarget {
@@ -115,57 +116,58 @@ fn tool_schema(name: &str) -> Value {
         })),
         "issue.save" => with_common_presentation(json!({
             "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "description": "Mandatory issue category.",
-                    "enum": ["feature", "bug"]
-                },
-                "slug": {
-                    "type": "string",
-                    "description": "Stable slug. Stored at `issues/<category>/<slug>.md` under the bound project's external state root."
-                },
-                "body": {
-                    "type": "string",
-                    "description": "Freeform issue body. Markdown is fine."
-                }
-            },
+            "properties": issue_save_properties(),
             "required": ["category", "slug", "body"]
         })),
-        "issue.delete" => with_common_presentation(json!({
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "description": "Mandatory issue category.",
-                    "enum": ["feature", "bug"]
-                },
-                "slug": {
-                    "type": "string",
-                    "description": "Issue slug to delete within the selected category."
-                }
-            },
-            "required": ["category", "slug"]
-        })),
-        "issue.read" => with_common_presentation(json!({
-            "type": "object",
-            "properties": {
-                "category": {
-                    "type": "string",
-                    "description": "Mandatory issue category.",
-                    "enum": ["feature", "bug"]
-                },
-                "slug": {
-                    "type": "string",
-                    "description": "Issue slug to read within the selected category."
-                }
-            },
-            "required": ["category", "slug"]
-        })),
+        "issue.delete" => issue_key_schema("Issue slug to delete within the selected category."),
+        "issue.read" => issue_key_schema("Issue slug to read within the selected category."),
         "issue.list" | "system.health" | "system.telemetry" => with_common_presentation(json!({
             "type": "object",
             "properties": {}
         })),
         _ => Value::Null,
     }
+}
+
+fn issue_save_properties() -> Map<String, Value> {
+    let mut properties = issue_key_properties(
+        "Stable slug. Stored at `issues/<category>/<slug>.md` under the bound project's external state root.",
+    );
+    let _ = properties.insert(
+        "body".to_owned(),
+        json!({
+            "type": "string",
+            "description": "Freeform issue body. Markdown is fine."
+        }),
+    );
+    properties
+}
+
+fn issue_key_schema(slug_description: &'static str) -> Value {
+    with_common_presentation(json!({
+        "type": "object",
+        "properties": issue_key_properties(slug_description),
+        "required": ["category", "slug"]
+    }))
+}
+
+fn issue_key_properties(slug_description: &'static str) -> Map<String, Value> {
+    let mut properties = Map::new();
+    let _ = properties.insert("category".to_owned(), issue_category_schema());
+    let _ = properties.insert(
+        "slug".to_owned(),
+        json!({
+            "type": "string",
+            "description": slug_description
+        }),
+    );
+    properties
+}
+
+fn issue_category_schema() -> Value {
+    json!({
+        "type": "string",
+        "description": "Mandatory issue category.",
+        "enum": IssueCategory::all().map(IssueCategory::as_str)
+    })
 }

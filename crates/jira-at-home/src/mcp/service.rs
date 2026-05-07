@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use libmcp::{Generation, SurfaceKind};
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::mcp::fault::{FaultRecord, FaultStage};
 use crate::mcp::output::{
@@ -225,21 +225,27 @@ fn issue_save_output(
     } else {
         "updated"
     };
-    let concise = json!({
-        "category": receipt.key.category,
-        "slug": receipt.key.slug,
-        "status": status,
-        "path": relative_path,
-        "updated_at": format_timestamp(receipt.updated_at),
-    });
-    let full = json!({
-        "category": receipt.key.category,
-        "slug": receipt.key.slug,
-        "status": status,
-        "path": relative_path,
-        "updated_at": format_timestamp(receipt.updated_at),
-        "bytes": receipt.bytes,
-    });
+    let updated_at = format_timestamp(receipt.updated_at);
+    let concise = issue_key_payload(
+        &receipt.key,
+        [
+            ("status", json!(status)),
+            ("path", json!(relative_path)),
+            ("updated_at", json!(updated_at)),
+        ],
+    );
+    let full = issue_key_payload(
+        &receipt.key,
+        [
+            ("status", json!(status)),
+            (
+                "path",
+                json!(relative_issue_path(&receipt.path, state_root)),
+            ),
+            ("updated_at", json!(format_timestamp(receipt.updated_at))),
+            ("bytes", json!(receipt.bytes)),
+        ],
+    );
     fallback_detailed_tool_output(
         &concise,
         &full,
@@ -266,21 +272,26 @@ fn issue_delete_output(
 ) -> Result<ToolOutput, FaultRecord> {
     let relative_path = relative_issue_path(&receipt.path, state_root);
     let deleted_at = format_timestamp(receipt.deleted_at);
-    let concise = json!({
-        "category": receipt.key.category,
-        "slug": receipt.key.slug,
-        "status": "deleted",
-        "path": relative_path,
-        "deleted_at": deleted_at.clone(),
-    });
-    let full = json!({
-        "category": receipt.key.category,
-        "slug": receipt.key.slug,
-        "status": "deleted",
-        "path": relative_issue_path(&receipt.path, state_root),
-        "deleted_at": format_timestamp(receipt.deleted_at),
-        "bytes": receipt.bytes,
-    });
+    let concise = issue_key_payload(
+        &receipt.key,
+        [
+            ("status", json!("deleted")),
+            ("path", json!(relative_path)),
+            ("deleted_at", json!(deleted_at.clone())),
+        ],
+    );
+    let full = issue_key_payload(
+        &receipt.key,
+        [
+            ("status", json!("deleted")),
+            (
+                "path",
+                json!(relative_issue_path(&receipt.path, state_root)),
+            ),
+            ("deleted_at", json!(format_timestamp(receipt.deleted_at))),
+            ("bytes", json!(receipt.bytes)),
+        ],
+    );
     fallback_detailed_tool_output(
         &concise,
         &full,
@@ -307,22 +318,22 @@ fn issue_list_output(
     let concise_items = issues
         .iter()
         .map(|issue| {
-            json!({
-                "category": issue.key.category,
-                "slug": issue.key.slug,
-                "updated_at": format_timestamp(issue.updated_at),
-            })
+            issue_key_payload(
+                &issue.key,
+                [("updated_at", json!(format_timestamp(issue.updated_at)))],
+            )
         })
         .collect::<Vec<_>>();
     let full_items = issues
         .iter()
         .map(|issue| {
-            json!({
-                "category": issue.key.category,
-                "slug": issue.key.slug,
-                "path": relative_issue_path(&issue.path, state_root),
-                "updated_at": format_timestamp(issue.updated_at),
-            })
+            issue_key_payload(
+                &issue.key,
+                [
+                    ("path", json!(relative_issue_path(&issue.path, state_root))),
+                    ("updated_at", json!(format_timestamp(issue.updated_at))),
+                ],
+            )
         })
         .collect::<Vec<_>>();
     let mut lines = vec![format!("{} issue(s)", issues.len())];
@@ -346,20 +357,22 @@ fn issue_read_output(
     operation: &str,
 ) -> Result<ToolOutput, FaultRecord> {
     let relative_path = relative_issue_path(&record.path, state_root);
-    let concise = json!({
-        "category": record.key.category,
-        "slug": record.key.slug,
-        "updated_at": format_timestamp(record.updated_at),
-        "body": record.body,
-    });
-    let full = json!({
-        "category": record.key.category,
-        "slug": record.key.slug,
-        "path": relative_path,
-        "updated_at": format_timestamp(record.updated_at),
-        "bytes": record.bytes,
-        "body": record.body,
-    });
+    let concise = issue_key_payload(
+        &record.key,
+        [
+            ("updated_at", json!(format_timestamp(record.updated_at))),
+            ("body", json!(&record.body)),
+        ],
+    );
+    let full = issue_key_payload(
+        &record.key,
+        [
+            ("path", json!(relative_path)),
+            ("updated_at", json!(format_timestamp(record.updated_at))),
+            ("bytes", json!(record.bytes)),
+            ("body", json!(&record.body)),
+        ],
+    );
     let concise_text = format!(
         "issue {}\nupdated: {}\n\n{}",
         record.key,
@@ -384,6 +397,21 @@ fn issue_read_output(
         FaultStage::Worker,
         operation,
     )
+}
+
+fn issue_key_payload(
+    key: &IssueKey,
+    fields: impl IntoIterator<Item = (&'static str, Value)>,
+) -> Value {
+    let mut payload = Map::new();
+    let _ = payload.insert("category".to_owned(), json!(key.category));
+    let _ = payload.insert("slug".to_owned(), json!(&key.slug));
+    payload.extend(
+        fields
+            .into_iter()
+            .map(|(field, value)| (field.to_owned(), value)),
+    );
+    Value::Object(payload)
 }
 
 fn relative_issue_path(path: &Path, project_root: &Path) -> String {
