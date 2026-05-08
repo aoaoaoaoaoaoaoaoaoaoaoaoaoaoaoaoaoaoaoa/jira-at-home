@@ -2,8 +2,6 @@
 
 drooling, braindead issue tracking MCP.
 
-No workflow. No status. No ceremony.
-
 It parks Markdown outside the repo:
 
 ```text
@@ -25,7 +23,6 @@ Rules:
 - every issue is `feature` or `bug`
 - category is mandatory
 - delete means obliterate
-- legacy root files under `issues/*.md` are ignored
 
 Run:
 
