@@ -664,6 +664,80 @@ fn convergent_issue_list_survives_worker_crash() -> TestResult {
 }
 
 #[test]
+fn uncertain_issue_save_is_never_replayed() -> TestResult {
+    let project_root = temp_project_root("never_replay")?;
+    let state_home = project_root.join("state-home");
+    must(fs::create_dir_all(&state_home), "create state home")?;
+    let mut harness = McpHarness::spawn(
+        Some(&project_root),
+        &state_home,
+        &[(
+            "JIRA_AT_HOME_MCP_TEST_HOST_CRASH_ONCE_KEY",
+            "tools/call:issue.save",
+        )],
+    )?;
+    let _ = harness.initialize()?;
+    harness.notify_initialized()?;
+
+    let bind = harness.bind_project(2, &project_root)?;
+    assert_tool_ok(&bind);
+    let state_root = must_some(
+        tool_content(&bind)["state_root"]
+            .as_str()
+            .map(PathBuf::from),
+        "state root in bind response",
+    )?;
+
+    let save = harness.call_tool(
+        3,
+        "issue.save",
+        json!({
+            "category": "bug",
+            "slug": "uncertain-effect",
+            "body": "this write must never be dispatched twice",
+        }),
+    )?;
+    assert_tool_error(&save);
+    assert_eq!(
+        tool_fault(&save)["fault"]["code"].as_str(),
+        Some("ambiguous_outcome")
+    );
+
+    let telemetry = harness.call_tool_full(4, "system.telemetry", json!({}))?;
+    assert_tool_ok(&telemetry);
+    let totals = &tool_content(&telemetry)["telemetry"]["totals"];
+    assert_eq!(totals["error_count"].as_u64(), Some(1));
+    assert_eq!(totals["response_error_count"].as_u64(), Some(0));
+    assert_eq!(totals["recovery_error_count"].as_u64(), Some(1));
+    assert_eq!(totals["recovery_fault_count"].as_u64(), Some(1));
+    assert_eq!(totals["retry_count"].as_u64(), Some(0));
+
+    let list = harness.call_tool(5, "issue.list", json!({}))?;
+    assert_tool_ok(&list);
+    assert!(
+        tool_content(&list)["count"]
+            .as_u64()
+            .is_some_and(|count| count <= 1),
+        "an uncertain save must not create duplicate effects: {list:#}"
+    );
+
+    let events = must(
+        read_json_lines::<Value>(&state_root.join("mcp").join("telemetry.jsonl")),
+        "read telemetry log",
+    )?;
+    let save_event = must_some(
+        events
+            .iter()
+            .find(|event| event["event"] == "tool_call" && event["tool_name"] == "issue.save"),
+        "ambiguous issue.save telemetry event",
+    )?;
+    assert_eq!(save_event["replay_attempts"].as_u64(), Some(0));
+    assert_eq!(save_event["outcome"].as_str(), Some("error"));
+    assert_eq!(save_event["error_kind"].as_str(), Some("ambiguous_outcome"));
+    Ok(())
+}
+
+#[test]
 fn host_rollout_reexec_preserves_session_and_binding() -> TestResult {
     let project_root = temp_project_root("rollout")?;
     let state_home = project_root.join("state-home");

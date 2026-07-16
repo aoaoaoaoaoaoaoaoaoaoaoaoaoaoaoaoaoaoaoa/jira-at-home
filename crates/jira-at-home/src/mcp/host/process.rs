@@ -169,6 +169,10 @@ impl WorkerSupervisor {
         }
     }
 
+    pub(super) fn ensure_ready(&mut self) -> Result<(), FaultRecord> {
+        self.ensure_worker()
+    }
+
     pub(super) fn restart(&mut self) -> Result<(), FaultRecord> {
         self.kill_current_worker();
         self.ensure_worker()
@@ -205,7 +209,14 @@ impl WorkerSupervisor {
             ));
         };
         let generation = if self.has_spawned {
-            self.generation.next()
+            self.generation.next().map_err(|error| {
+                FaultRecord::internal(
+                    self.generation,
+                    FaultStage::Host,
+                    "worker.spawn",
+                    error.to_string(),
+                )
+            })?
         } else {
             self.generation
         };

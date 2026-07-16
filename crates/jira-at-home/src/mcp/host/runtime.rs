@@ -6,8 +6,9 @@ use std::process::Command;
 use std::time::Instant;
 
 use libmcp::{
-    FramedMessage, Generation, HostSessionKernel, ReplayContract, RequestId, RolloutState,
-    TelemetryLog, ToolOutcome, load_snapshot_file_from_env, remove_snapshot_file,
+    DispatchQueueOutcome, FrameLimit, FramedMessage, Generation, HostRejection, HostSessionKernel,
+    ReplayBudget, ReplayContract, RequestId, RolloutState, RpcEnvelopeKind, SessionPhase,
+    SnapshotLimits, TelemetryFlushPolicy, TelemetryLog, ToolOutcome, load_snapshot_file_from_env,
     write_snapshot_file,
 };
 use serde::Serialize;
@@ -26,6 +27,11 @@ use crate::mcp::protocol::{
 };
 use crate::mcp::telemetry::ServerTelemetry;
 use crate::store::IssueStore;
+
+const HOST_SNAPSHOT_MAX_BYTES: usize = 16 * 1024 * 1024;
+const PENDING_CAPACITY: usize = 1;
+const RECOVERY_QUEUE_CAPACITY: usize = 1;
+const MAX_REPLAY_ATTEMPTS: u8 = 1;
 
 pub(crate) fn run_host(initial_project: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
@@ -69,11 +75,17 @@ impl HostRuntime {
         let executable = std::env::current_exe()?;
         let binary = BinaryRuntime::new(executable.clone())?;
         let restored = restore_host_state()?;
-        let session_kernel = restored
-            .as_ref()
-            .map(|seed| seed.session_kernel.clone().restore())
-            .transpose()?
-            .map_or_else(HostSessionKernel::cold, HostSessionKernel::from_restored);
+        let session_kernel = if let Some(seed) = restored.as_ref() {
+            let limits = SnapshotLimits::try_new(
+                PENDING_CAPACITY,
+                0,
+                FrameLimit::DEFAULT.get(),
+                MAX_REPLAY_ATTEMPTS,
+            )?;
+            seed.session_kernel.clone().restore(limits)?
+        } else {
+            HostSessionKernel::cold()
+        };
         let telemetry = restored
             .as_ref()
             .map_or_else(ServerTelemetry::default, |seed| seed.telemetry.clone());
@@ -149,63 +161,97 @@ impl HostRuntime {
     }
 
     fn handle_frame(&mut self, frame: FramedMessage) -> Option<Value> {
-        self.session_kernel.observe_client_frame(&frame);
-        let Some(object) = frame.value.as_object() else {
-            return Some(jsonrpc_error(
-                Value::Null,
-                FaultRecord::invalid_input(
-                    self.worker.generation(),
-                    FaultStage::Protocol,
-                    "jsonrpc.message",
-                    "invalid request: expected JSON object",
-                ),
-            ));
+        let (request_id, method) = match frame.classify() {
+            RpcEnvelopeKind::Request { id, method } => (Some(id), method),
+            RpcEnvelopeKind::Notification { method } => (None, method),
+            RpcEnvelopeKind::Response { .. } => return None,
         };
-        let method = object.get("method").and_then(Value::as_str)?;
-        let id = object.get("id").cloned();
+        let object = frame.value().as_object()?;
+        let id = request_id.as_ref().map(RequestId::to_json_value);
         let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
-        let operation_key = operation_key(method, &params);
+        let operation_key = operation_key(method.as_str(), &params);
         let started_at = Instant::now();
 
         self.telemetry.record_request(&operation_key);
-        let response = match self.dispatch(&frame, method, params, id.clone()) {
+        let admission = self
+            .session_kernel
+            .observe_client_frame(&frame)
+            .map_err(|rejection| {
+                FaultRecord::host_rejection(
+                    self.worker.generation(),
+                    FaultStage::Protocol,
+                    &operation_key,
+                    rejection,
+                )
+            })
+            .and_then(|()| {
+                if request_id.is_some() && !worker_dispatch(method.as_str(), &params) {
+                    self.session_kernel
+                        .begin_request_dispatch(
+                            &frame,
+                            replay_contract(method.as_str(), &params),
+                            PENDING_CAPACITY,
+                        )
+                        .map(|_| ())
+                        .map_err(|rejection| {
+                            FaultRecord::host_rejection(
+                                self.worker.generation(),
+                                FaultStage::Host,
+                                &operation_key,
+                                rejection,
+                            )
+                        })
+                } else {
+                    Ok(())
+                }
+            });
+        let dispatched =
+            admission.and_then(|()| self.dispatch(&frame, method.as_str(), params, id.clone()));
+        let response = match dispatched {
             Ok(Some(result)) => {
                 let latency_ms = elapsed_ms(started_at.elapsed());
-                self.telemetry.record_success(
-                    &operation_key,
+                self.telemetry.record_success(&operation_key, latency_ms);
+                self.record_tool_completion_from_frame(
+                    &frame,
+                    request_id.as_ref(),
                     latency_ms,
-                    self.worker.generation(),
-                    self.worker.is_alive(),
+                    None,
                 );
                 id.map(|id| jsonrpc_result(id, result))
             }
             Ok(None) => {
                 let latency_ms = elapsed_ms(started_at.elapsed());
-                self.telemetry.record_success(
-                    &operation_key,
+                self.telemetry.record_success(&operation_key, latency_ms);
+                self.record_tool_completion_from_frame(
+                    &frame,
+                    request_id.as_ref(),
                     latency_ms,
-                    self.worker.generation(),
-                    self.worker.is_alive(),
+                    None,
                 );
                 None
             }
             Err(fault) => {
                 let latency_ms = elapsed_ms(started_at.elapsed());
-                self.telemetry.record_error(
-                    &operation_key,
-                    &fault,
+                self.telemetry
+                    .record_error(&operation_key, &fault, latency_ms);
+                self.record_tool_completion_from_frame(
+                    &frame,
+                    request_id.as_ref(),
                     latency_ms,
-                    self.worker.generation(),
+                    Some(&fault),
                 );
-                Some(match id {
-                    Some(id) if method == "tools/call" => {
-                        jsonrpc_result(id, fault.into_tool_result())
-                    }
-                    Some(id) => jsonrpc_error(id, fault),
-                    None => jsonrpc_error(Value::Null, fault),
+                id.map(|id| match method.as_str() {
+                    "tools/call" => jsonrpc_result(id, fault.into_tool_result()),
+                    _ => jsonrpc_error(id, fault),
                 })
             }
         };
+
+        if let (Some(request_id), Some(response)) = (request_id.as_ref(), response.as_ref())
+            && self.session_kernel.pending_request(request_id).is_some()
+        {
+            complete_public_response(&mut self.session_kernel, response);
+        }
 
         if self.should_force_rollout(&operation_key) {
             self.force_rollout_consumed = true;
@@ -285,18 +331,7 @@ impl HostRuntime {
             )
         })?;
         match spec.dispatch {
-            DispatchTarget::Host => {
-                let started_at = Instant::now();
-                let request_id = request_id_from_frame(request_frame);
-                let result = self.handle_host_tool(&envelope.name, envelope.arguments);
-                self.record_host_tool_completion(
-                    request_frame,
-                    request_id.as_ref(),
-                    elapsed_ms(started_at.elapsed()),
-                    result.as_ref().err(),
-                );
-                result
-            }
+            DispatchTarget::Host => self.handle_host_tool(&envelope.name, envelope.arguments),
             DispatchTarget::Worker => {
                 self.dispatch_worker_tool(request_frame, spec, envelope.arguments)
             }
@@ -335,47 +370,130 @@ impl HostRuntime {
             self.worker.arm_crash_once();
         }
 
-        self.session_kernel
-            .record_forwarded_request(request_frame, replay);
-        let forwarded_request_id = request_id_from_frame(request_frame);
-        let host_request_id = self.allocate_request_id();
-        let started_at = Instant::now();
-        let mut replay_attempts = 0;
-
-        let outcome = match self
+        let generation_before_spawn = self.worker.generation();
+        self.worker.ensure_ready()?;
+        if self.worker.generation() > generation_before_spawn {
+            self.telemetry.replace_worker(self.worker.generation());
+        }
+        let _request_id = self
+            .session_kernel
+            .begin_request_dispatch(request_frame, replay, PENDING_CAPACITY)
+            .map_err(|rejection| {
+                FaultRecord::host_rejection(
+                    self.worker.generation(),
+                    FaultStage::Host,
+                    &operation,
+                    rejection,
+                )
+            })?;
+        let host_request_id = self.allocate_request_id(&operation)?;
+        match self
             .worker
             .execute(host_request_id, worker_operation.clone())
         {
             Ok(result) => Ok(result),
             Err(fault) => {
                 if replay == ReplayContract::Convergent && fault.retryable {
-                    replay_attempts = 1;
-                    self.telemetry.record_retry(&operation);
+                    self.telemetry.record_recovery_fault(&operation, &fault);
+                    let recovery = self
+                        .session_kernel
+                        .requeue_pending_for_replay(ReplayBudget {
+                            max_attempts: MAX_REPLAY_ATTEMPTS,
+                            queue_capacity: RECOVERY_QUEUE_CAPACITY,
+                        });
+                    if let Some(rejected) = recovery.rejected.into_iter().next() {
+                        return Err(FaultRecord::host_rejection(
+                            self.worker.generation(),
+                            FaultStage::Host,
+                            &operation,
+                            rejected.reason,
+                        ));
+                    }
                     self.worker
                         .restart()
                         .map_err(|restart_fault| restart_fault.mark_retried())?;
-                    self.telemetry
-                        .record_worker_restart(self.worker.generation());
-                    self.worker
-                        .execute(host_request_id, worker_operation)
-                        .map_err(FaultRecord::mark_retried)
+                    self.telemetry.replace_worker(self.worker.generation());
+                    let dispatch =
+                        self.session_kernel
+                            .pop_next_dispatch()
+                            .map_err(|rejection| {
+                                FaultRecord::host_rejection(
+                                    self.worker.generation(),
+                                    FaultStage::Host,
+                                    &operation,
+                                    rejection,
+                                )
+                            })?;
+                    let DispatchQueueOutcome::Replay(replay_frame) = dispatch else {
+                        return Err(FaultRecord::internal(
+                            self.worker.generation(),
+                            FaultStage::Host,
+                            &operation,
+                            "recovery kernel did not authorize the scheduled replay",
+                        ));
+                    };
+                    if replay_frame.payload() != request_frame.payload() {
+                        return Err(FaultRecord::internal(
+                            self.worker.generation(),
+                            FaultStage::Host,
+                            &operation,
+                            "recovery kernel returned a divergent replay frame",
+                        ));
+                    }
+                    self.telemetry.record_replay(&operation);
+                    match self.worker.execute(host_request_id, worker_operation) {
+                        Err(replay_fault) if replay_fault.retryable => {
+                            self.telemetry
+                                .record_recovery_fault(&operation, &replay_fault);
+                            let recovery =
+                                self.session_kernel
+                                    .requeue_pending_for_replay(ReplayBudget {
+                                        max_attempts: MAX_REPLAY_ATTEMPTS,
+                                        queue_capacity: RECOVERY_QUEUE_CAPACITY,
+                                    });
+                            let Some(rejected) = recovery.rejected.into_iter().next() else {
+                                return Err(FaultRecord::internal(
+                                    self.worker.generation(),
+                                    FaultStage::Host,
+                                    &operation,
+                                    "recovery kernel accepted a replay beyond the attempt budget",
+                                ));
+                            };
+                            Err(FaultRecord::host_rejection(
+                                self.worker.generation(),
+                                FaultStage::Host,
+                                &operation,
+                                rejected.reason,
+                            )
+                            .mark_retried())
+                        }
+                        Err(replay_fault) => Err(replay_fault.mark_retried()),
+                        Ok(result) => Ok(result),
+                    }
+                } else if fault.retryable {
+                    self.telemetry.record_recovery_fault(&operation, &fault);
+                    let recovery = self
+                        .session_kernel
+                        .requeue_pending_for_replay(ReplayBudget {
+                            max_attempts: MAX_REPLAY_ATTEMPTS,
+                            queue_capacity: RECOVERY_QUEUE_CAPACITY,
+                        });
+                    let rejection = recovery
+                        .rejected
+                        .into_iter()
+                        .next()
+                        .map_or(HostRejection::AmbiguousOutcome, |rejected| rejected.reason);
+                    Err(FaultRecord::host_rejection(
+                        self.worker.generation(),
+                        FaultStage::Host,
+                        &operation,
+                        rejection,
+                    ))
                 } else {
                     Err(fault)
                 }
             }
-        };
-
-        let completed = forwarded_request_id
-            .as_ref()
-            .and_then(|request_id| self.session_kernel.take_completed_request(request_id));
-        self.record_worker_tool_completion(
-            forwarded_request_id.as_ref(),
-            completed.as_ref(),
-            elapsed_ms(started_at.elapsed()),
-            replay_attempts,
-            outcome.as_ref().err(),
-        );
-        outcome
+        }
     }
 
     fn handle_host_tool(&mut self, name: &str, arguments: Value) -> Result<Value, FaultRecord> {
@@ -427,12 +545,13 @@ impl HostRuntime {
                 } else {
                     RolloutState::Stable
                 };
-                let health = self.telemetry.health_snapshot(rollout);
+                let worker_alive = self.worker.is_alive();
+                let health = self.telemetry.health_snapshot(rollout, worker_alive);
                 tool_success(
                     system_health_output(
                         &health,
                         self.binding.as_ref(),
-                        self.worker.is_alive(),
+                        worker_alive,
                         self.binary.launch_path_stable,
                         generation,
                     )?,
@@ -443,9 +562,16 @@ impl HostRuntime {
                 )
             }
             "system.telemetry" => {
-                let snapshot = self.telemetry.telemetry_snapshot();
+                let worker_alive = self.worker.is_alive();
+                let snapshot = self.telemetry.telemetry_snapshot(worker_alive);
+                let hot_methods = self.telemetry.ranked_methods(worker_alive);
                 tool_success(
-                    system_telemetry_output(&snapshot, self.telemetry.host_rollouts(), generation)?,
+                    system_telemetry_output(
+                        &snapshot,
+                        &hot_methods,
+                        self.telemetry.host_rollouts(),
+                        generation,
+                    )?,
                     presentation,
                     generation,
                     FaultStage::Host,
@@ -485,19 +611,24 @@ impl HostRuntime {
     }
 
     fn session_initialized(&self) -> bool {
-        self.session_kernel
-            .initialization_seed()
-            .is_some_and(|seed| seed.initialized_notification.is_some())
+        self.session_kernel.session_phase() == SessionPhase::Live
     }
 
     fn seed_captured(&self) -> bool {
         self.session_kernel.initialization_seed().is_some()
     }
 
-    fn allocate_request_id(&mut self) -> HostRequestId {
+    fn allocate_request_id(&mut self, operation: &str) -> Result<HostRequestId, FaultRecord> {
         let id = HostRequestId(self.next_request_id);
-        self.next_request_id += 1;
-        id
+        self.next_request_id = self.next_request_id.checked_add(1).ok_or_else(|| {
+            FaultRecord::internal(
+                self.worker.generation(),
+                FaultStage::Host,
+                operation,
+                "private worker request identifier space is exhausted",
+            )
+        })?;
+        Ok(id)
     }
 
     fn maybe_roll_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -522,22 +653,20 @@ impl HostRuntime {
             force_rollout_consumed: self.force_rollout_consumed,
             crash_once_consumed: self.crash_once_consumed,
         };
-        let state_path = write_snapshot_file("jira-at-home-mcp-host-reexec", &state)?;
+        let state_capsule = write_snapshot_file("jira-at-home-mcp-host-reexec", &state)?;
         let mut command = Command::new(&self.binary.path);
         let _ = command.arg("mcp").arg("serve");
         if let Some(project) = self.initial_project.as_ref() {
             let _ = command.arg("--project").arg(project);
         }
-        let _ = command.env(HOST_STATE_ENV, &state_path);
+        let _ = command.env(HOST_STATE_ENV, state_capsule.path());
         #[cfg(unix)]
         {
             let error = command.exec();
-            let _ = remove_snapshot_file(&state_path);
             Err(Box::new(error))
         }
         #[cfg(not(unix))]
         {
-            let _ = remove_snapshot_file(&state_path);
             Err(Box::new(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "host rollout requires unix exec support",
@@ -564,7 +693,7 @@ impl HostRuntime {
         should_crash
     }
 
-    fn record_host_tool_completion(
+    fn record_tool_completion_from_frame(
         &mut self,
         request_frame: &FramedMessage,
         request_id: Option<&RequestId>,
@@ -574,30 +703,16 @@ impl HostRuntime {
         let Some(request_id) = request_id else {
             return;
         };
-        let Some(tool_meta) = libmcp::parse_tool_call_meta(request_frame, "tools/call") else {
+        let Some(tool_meta) =
+            libmcp::parse_tool_call_meta(request_frame, &libmcp::RpcMethod::tools_call())
+        else {
             return;
         };
-        self.record_tool_completion(request_id, &tool_meta, latency_ms, 0, fault);
-    }
-
-    fn record_worker_tool_completion(
-        &mut self,
-        request_id: Option<&RequestId>,
-        completed: Option<&libmcp::CompletedPendingRequest>,
-        latency_ms: u64,
-        replay_attempts: u8,
-        fault: Option<&FaultRecord>,
-    ) {
-        let Some(request_id) = request_id else {
-            return;
-        };
-        let Some(completed) = completed else {
-            return;
-        };
-        let Some(tool_meta) = completed.request.tool_call_meta.as_ref() else {
-            return;
-        };
-        self.record_tool_completion(request_id, tool_meta, latency_ms, replay_attempts, fault);
+        let replay_attempts = self
+            .session_kernel
+            .pending_request(request_id)
+            .map_or(0, libmcp::PendingRequest::replay_attempts);
+        self.record_tool_completion(request_id, &tool_meta, latency_ms, replay_attempts, fault);
     }
 
     fn record_tool_completion(
@@ -677,7 +792,10 @@ fn restore_binding(seed: ProjectBindingSeed) -> Result<ProjectBinding, Box<dyn s
 }
 
 fn restore_host_state() -> Result<Option<HostStateSeed>, Box<dyn std::error::Error>> {
-    Ok(load_snapshot_file_from_env(HOST_STATE_ENV)?)
+    Ok(load_snapshot_file_from_env(
+        HOST_STATE_ENV,
+        HOST_SNAPSHOT_MAX_BYTES,
+    )?)
 }
 
 fn open_telemetry_log(binding: &ProjectBinding) -> io::Result<TelemetryLog> {
@@ -689,6 +807,7 @@ fn open_telemetry_log(binding: &ProjectBinding) -> io::Result<TelemetryLog> {
             .as_path(),
         binding.project_root.as_path(),
         1,
+        TelemetryFlushPolicy::PageCache,
     )
 }
 
@@ -836,24 +955,29 @@ fn system_health_output(
 
 fn system_telemetry_output(
     telemetry: &libmcp::TelemetrySnapshot,
+    ranked_methods: &[libmcp::MethodTelemetry],
     host_rollouts: u64,
     generation: Generation,
 ) -> Result<ToolOutput, FaultRecord> {
-    let hot_methods = telemetry.methods.iter().take(6).collect::<Vec<_>>();
+    let hot_methods = ranked_methods.iter().take(6).collect::<Vec<_>>();
     let concise = json!({
-        "requests": telemetry.totals.request_count,
-        "successes": telemetry.totals.success_count,
-        "response_errors": telemetry.totals.response_error_count,
-        "transport_faults": telemetry.totals.transport_fault_count,
-        "retries": telemetry.totals.retry_count,
+        "requests": telemetry.totals.request_count(),
+        "successes": telemetry.totals.success_count(),
+        "errors": telemetry.totals.error_count(),
+        "response_errors": telemetry.totals.response_error_count(),
+        "recovery_errors": telemetry.totals.recovery_error_count(),
+        "recovery_faults": telemetry.totals.recovery_fault_count(),
+        "retries": telemetry.totals.retry_count(),
         "worker_restarts": telemetry.restart_count,
         "host_rollouts": host_rollouts,
         "hot_methods": hot_methods.iter().map(|method| json!({
-            "method": method.method,
-            "requests": method.request_count,
-            "response_errors": method.response_error_count,
-            "transport_faults": method.transport_fault_count,
-            "retries": method.retry_count,
+            "method": method.method(),
+            "requests": method.request_count(),
+            "errors": method.error_count(),
+            "response_errors": method.response_error_count(),
+            "recovery_errors": method.recovery_error_count(),
+            "recovery_faults": method.recovery_fault_count(),
+            "retries": method.retry_count(),
         })).collect::<Vec<_>>(),
     });
     let full = json!({
@@ -861,12 +985,14 @@ fn system_telemetry_output(
         "host_rollouts": host_rollouts,
     });
     let mut lines = vec![format!(
-        "requests={} success={} response_error={} transport_fault={} retry={}",
-        telemetry.totals.request_count,
-        telemetry.totals.success_count,
-        telemetry.totals.response_error_count,
-        telemetry.totals.transport_fault_count,
-        telemetry.totals.retry_count
+        "requests={} success={} error={} response_error={} recovery_error={} recovery_fault={} retry={}",
+        telemetry.totals.request_count(),
+        telemetry.totals.success_count(),
+        telemetry.totals.error_count(),
+        telemetry.totals.response_error_count(),
+        telemetry.totals.recovery_error_count(),
+        telemetry.totals.recovery_fault_count(),
+        telemetry.totals.retry_count()
     )];
     lines.push(format!(
         "worker_restarts={} host_rollouts={host_rollouts}",
@@ -876,12 +1002,12 @@ fn system_telemetry_output(
         lines.push("hot methods:".to_owned());
         for method in hot_methods {
             lines.push(format!(
-                "{} req={} err={} transport={} retry={}",
-                method.method,
-                method.request_count,
-                method.response_error_count,
-                method.transport_fault_count,
-                method.retry_count,
+                "{} req={} err={} recovery={} retry={}",
+                method.method(),
+                method.request_count(),
+                method.error_count(),
+                method.recovery_fault_count(),
+                method.retry_count(),
             ));
         }
     }
@@ -922,12 +1048,35 @@ fn operation_key(method: &str, params: &Value) -> String {
     }
 }
 
-fn request_id_from_frame(frame: &FramedMessage) -> Option<RequestId> {
-    match frame.classify() {
-        libmcp::RpcEnvelopeKind::Request { id, .. } => Some(id),
-        libmcp::RpcEnvelopeKind::Notification { .. }
-        | libmcp::RpcEnvelopeKind::Response { .. }
-        | libmcp::RpcEnvelopeKind::Unknown => None,
+fn worker_dispatch(method: &str, params: &Value) -> bool {
+    method == "tools/call"
+        && params
+            .get("name")
+            .and_then(Value::as_str)
+            .and_then(tool_spec)
+            .is_some_and(|spec| spec.dispatch == DispatchTarget::Worker)
+}
+
+fn replay_contract(method: &str, params: &Value) -> ReplayContract {
+    if method != "tools/call" {
+        return ReplayContract::Convergent;
+    }
+    params
+        .get("name")
+        .and_then(Value::as_str)
+        .and_then(tool_spec)
+        .map_or(ReplayContract::NeverReplay, |spec| spec.replay)
+}
+
+fn complete_public_response(kernel: &mut HostSessionKernel, response: &Value) {
+    let Ok(payload) = serde_json::to_vec(response) else {
+        std::process::abort();
+    };
+    let Ok(frame) = FramedMessage::parse(payload) else {
+        std::process::abort();
+    };
+    if kernel.complete_response(&frame).is_err() {
+        std::process::abort();
     }
 }
 

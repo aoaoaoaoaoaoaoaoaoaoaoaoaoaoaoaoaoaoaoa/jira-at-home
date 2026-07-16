@@ -16,7 +16,7 @@ version = "1.0.0"
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6"
-libmcp = { git = "https://git.swarm.moe/libmcp.git", rev = "e325cd23f19378f543981071673c1d03be438fa5" }
+libmcp = { git = "https://git.swarm.moe/libmcp.git", rev = "6d9e1c1a1f123a57e0bcb152a7c992154661577e" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"

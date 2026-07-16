@@ -18,7 +18,7 @@ pub(crate) fn run_worker(
     project_root: PathBuf,
     generation: u64,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let generation = generation_from_wire(generation);
+    let generation = Generation::try_new(generation)?;
     let store = IssueStore::bind(project_root)?;
     let stdin = io::stdin();
     let mut stdout = io::stdout().lock();
@@ -172,7 +172,7 @@ fn deserialize<T: for<'de> Deserialize<'de>>(
     serde_json::from_value(value).map_err(|error| {
         FaultRecord::invalid_input(
             generation,
-            FaultStage::Protocol,
+            FaultStage::Worker,
             operation,
             format!("invalid params: {error}"),
         )
@@ -421,12 +421,4 @@ fn relative_issue_path(path: &Path, project_root: &Path) -> String {
         |_| path.display().to_string(),
         |relative| relative.display().to_string(),
     )
-}
-
-fn generation_from_wire(raw: u64) -> Generation {
-    let mut generation = Generation::genesis();
-    for _ in 1..raw {
-        generation = generation.next();
-    }
-    generation
 }

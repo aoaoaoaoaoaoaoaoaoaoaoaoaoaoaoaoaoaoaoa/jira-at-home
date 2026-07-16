@@ -187,9 +187,7 @@ fn projection_fault(
     FaultRecord::internal(generation, stage, operation, error.to_string())
 }
 
-const fn full_porcelain_config() -> JsonPorcelainConfig {
-    JsonPorcelainConfig {
-        max_lines: FULL_PORCELAIN_MAX_LINES,
-        max_inline_chars: FULL_PORCELAIN_MAX_INLINE_CHARS,
-    }
+fn full_porcelain_config() -> JsonPorcelainConfig {
+    JsonPorcelainConfig::try_new(FULL_PORCELAIN_MAX_LINES, FULL_PORCELAIN_MAX_INLINE_CHARS)
+        .unwrap_or_else(|_| std::process::abort())
 }

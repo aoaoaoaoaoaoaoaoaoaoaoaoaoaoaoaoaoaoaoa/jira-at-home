@@ -1,4 +1,6 @@
-use libmcp::{Fault, FaultClass, FaultCode, Generation, RecoveryDirective, ToolErrorDetail};
+use libmcp::{
+    Fault, FaultClass, FaultCode, Generation, HostRejection, RecoveryHint, ToolErrorDetail,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -23,6 +25,38 @@ pub(crate) struct FaultRecord {
 }
 
 impl FaultRecord {
+    pub(crate) fn host_rejection(
+        generation: Generation,
+        stage: FaultStage,
+        operation: impl Into<String>,
+        rejection: HostRejection,
+    ) -> Self {
+        let (class, code) = match rejection {
+            HostRejection::QueueOverflow => (FaultClass::Resource, "queue_overflow"),
+            HostRejection::ReplayBudgetExhausted => (FaultClass::Replay, "replay_budget_exhausted"),
+            HostRejection::DuplicateRequestId => (FaultClass::Protocol, "duplicate_request_id"),
+            HostRejection::PendingCapacityExhausted => {
+                (FaultClass::Resource, "pending_capacity_exhausted")
+            }
+            HostRejection::InvalidRequestFrame => (FaultClass::Protocol, "invalid_request_frame"),
+            HostRejection::AmbiguousOutcome => (FaultClass::AmbiguousOutcome, "ambiguous_outcome"),
+            HostRejection::RequestNotPending => (FaultClass::Invariant, "request_not_pending"),
+            HostRejection::InvalidExecutionState => {
+                (FaultClass::Invariant, "invalid_execution_state")
+            }
+        };
+        Self::new(
+            generation,
+            class,
+            code,
+            None,
+            stage,
+            operation,
+            rejection.message(),
+            rejection.code(),
+        )
+    }
+
     pub(crate) fn invalid_input(
         generation: Generation,
         stage: FaultStage,
@@ -33,7 +67,7 @@ impl FaultRecord {
             generation,
             FaultClass::Protocol,
             "invalid_input",
-            RecoveryDirective::AbortRequest,
+            None,
             stage,
             operation,
             detail,
@@ -51,7 +85,7 @@ impl FaultRecord {
             generation,
             FaultClass::Protocol,
             "not_initialized",
-            RecoveryDirective::AbortRequest,
+            None,
             stage,
             operation,
             detail,
@@ -69,7 +103,7 @@ impl FaultRecord {
             generation,
             FaultClass::Resource,
             "unavailable",
-            RecoveryDirective::AbortRequest,
+            None,
             stage,
             operation,
             detail,
@@ -87,7 +121,7 @@ impl FaultRecord {
             generation,
             FaultClass::Transport,
             "transport_failure",
-            RecoveryDirective::RestartAndReplay,
+            Some(RecoveryHint::ReplaceWorker),
             stage,
             operation,
             detail,
@@ -105,7 +139,7 @@ impl FaultRecord {
             generation,
             FaultClass::Process,
             "process_failure",
-            RecoveryDirective::RestartAndReplay,
+            Some(RecoveryHint::ReplaceWorker),
             stage,
             operation,
             detail,
@@ -123,7 +157,7 @@ impl FaultRecord {
             generation,
             FaultClass::Invariant,
             "internal_failure",
-            RecoveryDirective::AbortRequest,
+            None,
             stage,
             operation,
             detail,
@@ -140,7 +174,7 @@ impl FaultRecord {
             generation,
             FaultClass::Rollout,
             "rollout_failure",
-            RecoveryDirective::RestartAndReplay,
+            Some(RecoveryHint::RollForward),
             FaultStage::Rollout,
             operation,
             detail,
@@ -188,15 +222,16 @@ impl FaultRecord {
         generation: Generation,
         class: FaultClass,
         code: &'static str,
-        directive: RecoveryDirective,
+        recovery_hint: Option<RecoveryHint>,
         stage: FaultStage,
         operation: impl Into<String>,
         detail: impl Into<String>,
         jsonrpc_code: i64,
     ) -> Self {
-        let fault = Fault::new(generation, class, fault_code(code), directive, detail);
+        let retryable = matches!(recovery_hint, Some(RecoveryHint::ReplaceWorker));
+        let fault = Fault::new(generation, class, fault_code(code), recovery_hint, detail);
         Self {
-            retryable: directive != RecoveryDirective::AbortRequest,
+            retryable,
             fault,
             stage,
             operation: operation.into(),

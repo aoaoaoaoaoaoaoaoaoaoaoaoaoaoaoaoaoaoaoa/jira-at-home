@@ -21,7 +21,7 @@ thiserror.workspace = true
 time.workspace = true
 
 [dev-dependencies]
-libmcp-testkit = { git = "https://git.swarm.moe/libmcp.git", rev = "e325cd23f19378f543981071673c1d03be438fa5", package = "libmcp-testkit" }
+libmcp-testkit = { git = "https://git.swarm.moe/libmcp.git", rev = "6d9e1c1a1f123a57e0bcb152a7c992154661577e", package = "libmcp-testkit" }
 
 [lints]
 workspace = true
