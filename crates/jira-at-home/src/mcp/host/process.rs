@@ -1,14 +1,15 @@
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter};
 use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
-use libmcp::Generation;
+use libmcp::{FrameLimit, FrameReadOutcome, Generation, read_frame_blocking};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::mcp::fault::{FaultRecord, FaultStage};
 use crate::mcp::protocol::{
-    HostRequestId, WorkerOperation, WorkerOutcome, WorkerRequest, WorkerResponse, WorkerSpawnConfig,
+    HostRequestId, WorkerOperation, WorkerOutcome, WorkerRequest, WorkerResponse,
+    WorkerSpawnConfig, write_sync_json_frame,
 };
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -93,28 +94,12 @@ impl WorkerSupervisor {
                 "worker stdin is not available",
             )
         })?;
-        serde_json::to_writer(&mut *stdin, &request).map_err(|error| {
+        write_sync_json_frame(stdin, &request, FrameLimit::DEFAULT).map_err(|error| {
             FaultRecord::transport(
                 self.generation,
                 FaultStage::Transport,
                 "worker.write",
-                format!("failed to encode worker request: {error}"),
-            )
-        })?;
-        stdin.write_all(b"\n").map_err(|error| {
-            FaultRecord::transport(
-                self.generation,
-                FaultStage::Transport,
-                "worker.write",
-                format!("failed to frame worker request: {error}"),
-            )
-        })?;
-        stdin.flush().map_err(|error| {
-            FaultRecord::transport(
-                self.generation,
-                FaultStage::Transport,
-                "worker.write",
-                format!("failed to flush worker request: {error}"),
+                format!("failed to write worker request: {error}"),
             )
         })?;
 
@@ -137,8 +122,7 @@ impl WorkerSupervisor {
                 "worker stdout is not available",
             )
         })?;
-        let mut line = String::new();
-        let bytes = stdout.read_line(&mut line).map_err(|error| {
+        let frame = read_frame_blocking(stdout, FrameLimit::DEFAULT).map_err(|error| {
             FaultRecord::transport(
                 self.generation,
                 FaultStage::Transport,
@@ -146,7 +130,7 @@ impl WorkerSupervisor {
                 format!("failed to read worker response: {error}"),
             )
         })?;
-        if bytes == 0 {
+        let FrameReadOutcome::Frame(payload) = frame else {
             self.kill_current_worker();
             return Err(FaultRecord::transport(
                 self.generation,
@@ -154,8 +138,8 @@ impl WorkerSupervisor {
                 "worker.read",
                 "worker exited before replying",
             ));
-        }
-        let response = serde_json::from_str::<WorkerResponse>(&line).map_err(|error| {
+        };
+        let response = serde_json::from_slice::<WorkerResponse>(&payload).map_err(|error| {
             FaultRecord::transport(
                 self.generation,
                 FaultStage::Transport,

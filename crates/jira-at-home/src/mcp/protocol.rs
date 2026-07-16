@@ -1,6 +1,7 @@
+use std::io::{self, Write};
 use std::path::PathBuf;
 
-use libmcp::{Generation, HostSessionKernelSnapshot};
+use libmcp::{FrameLimit, Generation, HostSessionKernelSnapshot};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -11,6 +12,20 @@ pub(crate) const SERVER_NAME: &str = "jira-at-home";
 pub(crate) const HOST_STATE_ENV: &str = "JIRA_AT_HOME_MCP_HOST_STATE";
 pub(crate) const FORCE_ROLLOUT_ENV: &str = "JIRA_AT_HOME_MCP_TEST_FORCE_ROLLOUT_KEY";
 pub(crate) const CRASH_ONCE_ENV: &str = "JIRA_AT_HOME_MCP_TEST_HOST_CRASH_ONCE_KEY";
+
+pub(crate) fn write_sync_json_frame(
+    writer: &mut impl Write,
+    value: &impl Serialize,
+    limit: FrameLimit,
+) -> io::Result<()> {
+    let payload = serde_json::to_vec(value).map_err(|error| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("failed to encode frame: {error}"),
+        )
+    })?;
+    libmcp::write_frame_blocking(writer, &payload, limit)
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct HostStateSeed {

@@ -168,7 +168,12 @@ impl McpHarness {
 
     fn request(&mut self, message: Value) -> TestResult<Value> {
         let encoded = must(serde_json::to_string(&message), "request json")?;
-        must(writeln!(self.stdin, "{encoded}"), "write request")?;
+        self.request_raw(encoded.as_bytes())
+    }
+
+    fn request_raw(&mut self, encoded: &[u8]) -> TestResult<Value> {
+        must(self.stdin.write_all(encoded), "write raw request")?;
+        must(self.stdin.write_all(b"\n"), "frame raw request")?;
         must(self.stdin.flush(), "flush request")?;
         let mut line = String::new();
         let byte_count = must(self.stdout.read_line(&mut line), "read response")?;
@@ -191,6 +196,56 @@ impl Drop for McpHarness {
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
+}
+
+#[test]
+fn public_protocol_distinguishes_parse_and_envelope_rejections() -> TestResult {
+    let project_root = temp_project_root("protocol_rejections")?;
+    let state_home = project_root.join("state-home");
+    must(fs::create_dir_all(&state_home), "create state home")?;
+    let mut harness = McpHarness::spawn(None, &state_home, &[])?;
+
+    let malformed = harness.request_raw(b"{")?;
+    assert_eq!(malformed["error"]["code"].as_i64(), Some(-32700));
+    assert_eq!(
+        malformed["error"]["data"]["fault"]["code"].as_str(),
+        Some("parse_error")
+    );
+
+    let duplicate = harness.request_raw(
+        br#"{"jsonrpc":"2.0","id":1,"method":"initialize","method":"ping","params":{}}"#,
+    )?;
+    assert_eq!(duplicate["error"]["code"].as_i64(), Some(-32600));
+    assert_eq!(
+        duplicate["error"]["data"]["fault"]["code"].as_str(),
+        Some("invalid_request")
+    );
+
+    let initialize = harness.initialize()?;
+    assert_eq!(initialize["id"].as_u64(), Some(1));
+    assert!(initialize.get("result").is_some());
+    Ok(())
+}
+
+#[test]
+fn public_transport_terminates_on_an_oversized_frame() -> TestResult {
+    let project_root = temp_project_root("oversized_frame")?;
+    let state_home = project_root.join("state-home");
+    must(fs::create_dir_all(&state_home), "create state home")?;
+    let mut harness = McpHarness::spawn(None, &state_home, &[])?;
+    let oversized = vec![b'x'; libmcp::FrameLimit::DEFAULT.get() + 1];
+
+    if let Err(error) = harness.stdin.write_all(&oversized)
+        && error.kind() != io::ErrorKind::BrokenPipe
+    {
+        return Err(error.into());
+    }
+    let status = must(harness.child.wait(), "wait for oversized-frame rejection")?;
+    assert!(
+        !status.success(),
+        "oversized public frame must terminate the host"
+    );
+    Ok(())
 }
 
 fn assert_tool_ok(response: &Value) {
@@ -711,6 +766,10 @@ fn uncertain_issue_save_is_never_replayed() -> TestResult {
     assert_eq!(totals["recovery_error_count"].as_u64(), Some(1));
     assert_eq!(totals["recovery_fault_count"].as_u64(), Some(1));
     assert_eq!(totals["retry_count"].as_u64(), Some(0));
+    assert_eq!(
+        tool_content(&telemetry)["telemetry"]["restart_count"].as_u64(),
+        Some(1)
+    );
 
     let list = harness.call_tool(5, "issue.list", json!({}))?;
     assert_tool_ok(&list);

@@ -1,7 +1,7 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufReader};
 use std::path::{Path, PathBuf};
 
-use libmcp::{Generation, SurfaceKind};
+use libmcp::{FrameLimit, FrameReadOutcome, Generation, SurfaceKind, read_frame_blocking};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -9,6 +9,7 @@ use crate::mcp::fault::{FaultRecord, FaultStage};
 use crate::mcp::output::{
     ToolOutput, fallback_detailed_tool_output, split_presentation, tool_success,
 };
+use crate::mcp::protocol::write_sync_json_frame;
 use crate::store::{
     DeleteReceipt, IssueBody, IssueCategory, IssueKey, IssueRecord, IssueSlug, IssueStore,
     SaveReceipt, StoreError, format_timestamp,
@@ -21,15 +22,14 @@ pub(crate) fn run_worker(
     let generation = Generation::try_new(generation)?;
     let store = IssueStore::bind(project_root)?;
     let stdin = io::stdin();
+    let mut stdin = BufReader::new(stdin.lock());
     let mut stdout = io::stdout().lock();
     let mut service = WorkerService::new(store, generation);
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request = serde_json::from_str::<crate::mcp::protocol::WorkerRequest>(&line)?;
+    while let FrameReadOutcome::Frame(payload) =
+        read_frame_blocking(&mut stdin, FrameLimit::DEFAULT)?
+    {
+        let request = serde_json::from_slice::<crate::mcp::protocol::WorkerRequest>(&payload)?;
         let response = match request {
             crate::mcp::protocol::WorkerRequest::Execute { id, operation } => {
                 let outcome = match service.execute(operation) {
@@ -39,9 +39,7 @@ pub(crate) fn run_worker(
                 crate::mcp::protocol::WorkerResponse { id, outcome }
             }
         };
-        serde_json::to_writer(&mut stdout, &response)?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
+        write_sync_json_frame(&mut stdout, &response, FrameLimit::DEFAULT)?;
     }
 
     Ok(())

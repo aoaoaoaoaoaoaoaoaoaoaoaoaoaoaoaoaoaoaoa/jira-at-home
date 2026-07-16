@@ -25,6 +25,40 @@ pub(crate) struct FaultRecord {
 }
 
 impl FaultRecord {
+    pub(crate) fn parse_error(
+        generation: Generation,
+        operation: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            generation,
+            FaultClass::Protocol,
+            "parse_error",
+            None,
+            FaultStage::Protocol,
+            operation,
+            detail,
+            -32700,
+        )
+    }
+
+    pub(crate) fn invalid_request(
+        generation: Generation,
+        operation: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::new(
+            generation,
+            FaultClass::Protocol,
+            "invalid_request",
+            None,
+            FaultStage::Protocol,
+            operation,
+            detail,
+            -32600,
+        )
+    }
+
     pub(crate) fn host_rejection(
         generation: Generation,
         stage: FaultStage,

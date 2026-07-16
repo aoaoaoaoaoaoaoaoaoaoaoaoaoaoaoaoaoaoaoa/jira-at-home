@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufReader, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -6,10 +6,10 @@ use std::process::Command;
 use std::time::Instant;
 
 use libmcp::{
-    DispatchQueueOutcome, FrameLimit, FramedMessage, Generation, HostRejection, HostSessionKernel,
-    ReplayBudget, ReplayContract, RequestId, RolloutState, RpcEnvelopeKind, SessionPhase,
-    SnapshotLimits, TelemetryFlushPolicy, TelemetryLog, ToolOutcome, load_snapshot_file_from_env,
-    write_snapshot_file,
+    DispatchQueueOutcome, FrameLimit, FrameParseError, FrameReadOutcome, FramedMessage, Generation,
+    HostRejection, HostSessionKernel, ReplayBudget, ReplayContract, RequestId, RolloutState,
+    RpcEnvelopeKind, SessionPhase, SnapshotLimits, TelemetryFlushPolicy, TelemetryLog, ToolOutcome,
+    load_snapshot_file_from_env, read_frame_blocking, write_snapshot_file,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -24,6 +24,7 @@ use crate::mcp::output::{
 use crate::mcp::protocol::{
     CRASH_ONCE_ENV, FORCE_ROLLOUT_ENV, HOST_STATE_ENV, HostRequestId, HostStateSeed,
     PROTOCOL_VERSION, ProjectBindingSeed, SERVER_NAME, WorkerOperation, WorkerSpawnConfig,
+    write_sync_json_frame,
 };
 use crate::mcp::telemetry::ServerTelemetry;
 use crate::store::IssueStore;
@@ -35,16 +36,14 @@ const MAX_REPLAY_ATTEMPTS: u8 = 1;
 
 pub(crate) fn run_host(initial_project: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
+    let mut stdin = BufReader::new(stdin.lock());
     let mut stdout = io::stdout().lock();
     let mut host = HostRuntime::new(initial_project)?;
 
-    for line in stdin.lock().lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let maybe_response = host.handle_line(&line);
+    while let FrameReadOutcome::Frame(payload) =
+        read_frame_blocking(&mut stdin, FrameLimit::DEFAULT)?
+    {
+        let maybe_response = host.handle_payload(payload);
         if let Some(response) = maybe_response {
             write_message(&mut stdout, &response)?;
         }
@@ -142,17 +141,26 @@ impl HostRuntime {
         })
     }
 
-    fn handle_line(&mut self, line: &str) -> Option<Value> {
-        let frame = match FramedMessage::parse(line.as_bytes().to_vec()) {
+    fn handle_payload(&mut self, payload: Vec<u8>) -> Option<Value> {
+        let frame = match FramedMessage::parse(payload) {
             Ok(frame) => frame,
+            Err(FrameParseError::InvalidJson(error)) => {
+                return Some(jsonrpc_error(
+                    Value::Null,
+                    FaultRecord::parse_error(
+                        self.worker.generation(),
+                        "jsonrpc.parse",
+                        format!("parse error: {error}"),
+                    ),
+                ));
+            }
             Err(error) => {
                 return Some(jsonrpc_error(
                     Value::Null,
-                    FaultRecord::invalid_input(
+                    FaultRecord::invalid_request(
                         self.worker.generation(),
-                        FaultStage::Protocol,
-                        "jsonrpc.parse",
-                        format!("parse error: {error}"),
+                        "jsonrpc.request",
+                        error.to_string(),
                     ),
                 ));
             }
@@ -483,6 +491,12 @@ impl HostRuntime {
                         .into_iter()
                         .next()
                         .map_or(HostRejection::AmbiguousOutcome, |rejected| rejected.reason);
+                    match self.worker.restart() {
+                        Ok(()) => self.telemetry.replace_worker(self.worker.generation()),
+                        Err(restart_fault) => self
+                            .telemetry
+                            .record_recovery_fault(&operation, &restart_fault),
+                    }
                     Err(FaultRecord::host_rejection(
                         self.worker.generation(),
                         FaultStage::Host,
@@ -1097,10 +1111,7 @@ fn jsonrpc_error(id: Value, fault: FaultRecord) -> Value {
 }
 
 fn write_message(stdout: &mut impl Write, message: &Value) -> io::Result<()> {
-    serde_json::to_writer(&mut *stdout, message)?;
-    stdout.write_all(b"\n")?;
-    stdout.flush()?;
-    Ok(())
+    write_sync_json_frame(stdout, message, FrameLimit::DEFAULT)
 }
 
 fn elapsed_ms(duration: std::time::Duration) -> u64 {
