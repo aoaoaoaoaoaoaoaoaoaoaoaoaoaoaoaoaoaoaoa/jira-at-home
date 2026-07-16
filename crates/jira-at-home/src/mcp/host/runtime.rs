@@ -106,8 +106,11 @@ impl HostRuntime {
             worker_generation,
             worker_spawned,
         );
-        if let Some(project_root) = binding.as_ref().map(|binding| binding.project_root.clone()) {
-            worker.rebind(project_root);
+        if let Some(worktree_root) = binding
+            .as_ref()
+            .map(|binding| binding.worktree_root.clone())
+        {
+            worker.rebind(worktree_root);
         }
 
         Ok(Self {
@@ -326,7 +329,7 @@ impl HostRuntime {
         worker_operation: WorkerOperation,
     ) -> Result<Value, FaultRecord> {
         let binding = self.require_bound_project(&operation)?;
-        self.worker.rebind(binding.project_root.clone());
+        self.worker.rebind(binding.worktree_root.clone());
 
         if self.should_crash_worker_once(&operation) {
             self.worker.arm_crash_once();
@@ -397,7 +400,7 @@ impl HostRuntime {
                         )
                     })?;
                 self.worker
-                    .refresh_binding(resolved.binding.project_root.clone());
+                    .refresh_binding(resolved.binding.worktree_root.clone());
                 self.telemetry_log =
                     Some(open_telemetry_log(&resolved.binding).map_err(|error| {
                         FaultRecord::internal(
@@ -635,6 +638,8 @@ struct ResolvedProjectBinding {
 struct ProjectBindStatus {
     requested_path: String,
     project_root: String,
+    worktree_root: String,
+    state_identity: String,
     issues_root: String,
     state_root: String,
     issue_count: usize,
@@ -650,12 +655,16 @@ fn resolve_project_binding(
         binding: ProjectBinding {
             requested_path: requested_path.clone(),
             project_root: layout.project_root.clone(),
+            worktree_root: layout.worktree_root.clone(),
+            state_identity: layout.state_identity.clone(),
             issues_root: layout.issues_root.clone(),
             state_root: layout.state_root.clone(),
         },
         status: ProjectBindStatus {
             requested_path: requested_path.display().to_string(),
             project_root: layout.project_root.display().to_string(),
+            worktree_root: layout.worktree_root.display().to_string(),
+            state_identity: layout.state_identity.display().to_string(),
             issues_root: layout.issues_root.display().to_string(),
             state_root: layout.state_root.display().to_string(),
             issue_count: status.issue_count,
@@ -692,19 +701,31 @@ fn project_bind_output(
     let _ = concise.insert("issues_root".to_owned(), json!(status.issues_root));
     let _ = concise.insert("state_root".to_owned(), json!(status.state_root));
     let _ = concise.insert("issue_count".to_owned(), json!(status.issue_count));
+    if status.worktree_root != status.project_root {
+        let _ = concise.insert("worktree_root".to_owned(), json!(status.worktree_root));
+    }
+    if status.state_identity != status.project_root {
+        let _ = concise.insert("state_identity".to_owned(), json!(status.state_identity));
+    }
     if status.requested_path != status.project_root {
         let _ = concise.insert("requested_path".to_owned(), json!(status.requested_path));
     }
+    let mut lines = vec![format!("bound project {}", status.project_root)];
+    if status.worktree_root != status.project_root {
+        lines.push(format!("worktree: {}", status.worktree_root));
+    }
+    if status.state_identity != status.project_root {
+        lines.push(format!("identity: {}", status.state_identity));
+    }
+    lines.extend([
+        format!("issues: {}", status.issues_root),
+        format!("state: {}", status.state_root),
+        format!("issues tracked: {}", status.issue_count),
+    ]);
     fallback_detailed_tool_output(
         &Value::Object(concise),
         status,
-        [
-            format!("bound project {}", status.project_root),
-            format!("issues: {}", status.issues_root),
-            format!("state: {}", status.state_root),
-            format!("issues tracked: {}", status.issue_count),
-        ]
-        .join("\n"),
+        lines.join("\n"),
         None,
         libmcp::SurfaceKind::Mutation,
         generation,
@@ -743,12 +764,20 @@ fn system_health_output(
             "issues_root".to_owned(),
             json!(binding.issues_root.display().to_string()),
         );
+        if binding.worktree_root != binding.project_root {
+            let _ = concise.insert(
+                "worktree_root".to_owned(),
+                json!(binding.worktree_root.display().to_string()),
+            );
+        }
     }
     let full = json!({
         "health": health,
         "binding": binding.map(|binding| json!({
             "requested_path": binding.requested_path.display().to_string(),
             "project_root": binding.project_root.display().to_string(),
+            "worktree_root": binding.worktree_root.display().to_string(),
+            "state_identity": binding.state_identity.display().to_string(),
             "issues_root": binding.issues_root.display().to_string(),
             "state_root": binding.state_root.display().to_string(),
         })),
@@ -770,6 +799,9 @@ fn system_health_output(
     )];
     if let Some(binding) = binding {
         lines.push(format!("project: {}", binding.project_root.display()));
+        if binding.worktree_root != binding.project_root {
+            lines.push(format!("worktree: {}", binding.worktree_root.display()));
+        }
         lines.push(format!("issues: {}", binding.issues_root.display()));
     }
     lines.push(format!(
@@ -947,6 +979,8 @@ impl From<&ProjectBinding> for ProjectBindingSeed {
         Self {
             requested_path: value.requested_path.clone(),
             project_root: value.project_root.clone(),
+            worktree_root: value.worktree_root.clone(),
+            state_identity: value.state_identity.clone(),
         }
     }
 }

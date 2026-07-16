@@ -28,6 +28,10 @@ pub(crate) struct HostStateSeed {
 pub(crate) struct ProjectBindingSeed {
     pub(crate) requested_path: PathBuf,
     pub(crate) project_root: PathBuf,
+    #[serde(default)]
+    pub(crate) worktree_root: PathBuf,
+    #[serde(default)]
+    pub(crate) state_identity: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]

@@ -202,6 +202,8 @@ fn store_fault(
             | StoreError::EmptyIssueBody
             | StoreError::IssueNotFound(_)
             | StoreError::MalformedIssueEntry(_, _)
+            | StoreError::MalformedGitIndirection(_, _)
+            | StoreError::LegacyMigrationConflict { .. }
             | StoreError::MissingProjectPath(_)
             | StoreError::ProjectPathNotDirectory(_) => {
                 FaultRecord::invalid_input(generation, stage, operation, error.to_string())

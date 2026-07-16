@@ -8,6 +8,9 @@ It parks Markdown outside the repo:
 ~/.local/state/jira_at_home/projects/.../issues/<feature|bug>/<slug>.md
 ```
 
+Git-linked worktrees share the same issue namespace via Git's common-dir
+identity; the linked worktree path is only the attachment point.
+
 Tools:
 
 - `project.bind`

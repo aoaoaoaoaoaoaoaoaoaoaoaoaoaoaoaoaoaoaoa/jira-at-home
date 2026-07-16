@@ -2,7 +2,7 @@ use clap as _;
 use dirs as _;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use libmcp as _;
@@ -37,6 +37,37 @@ fn temp_project_root(name: &str) -> TestResult<PathBuf> {
     ));
     must(fs::create_dir_all(&root), "create temp project root")?;
     Ok(root)
+}
+
+fn install_linked_worktree_gitdir(primary: &Path, linked: &Path) -> TestResult {
+    let primary_git = primary.join(".git");
+    let linked_gitdir = primary_git.join("worktrees").join("touching-demands");
+    must(fs::create_dir_all(&linked_gitdir), "create linked gitdir")?;
+    must(fs::create_dir_all(linked), "create linked worktree")?;
+    must(
+        fs::write(linked_gitdir.join("commondir"), "../..\n"),
+        "write linked commondir",
+    )?;
+    must(
+        fs::write(
+            linked.join(".git"),
+            format!("gitdir: {}\n", linked_gitdir.display()),
+        ),
+        "write linked gitdir file",
+    )?;
+    Ok(())
+}
+
+fn state_path_for(state_home: &Path, project_root: &Path) -> PathBuf {
+    let mut base = state_home.join("jira_at_home").join("projects");
+    for component in project_root.components() {
+        match component {
+            Component::Normal(part) => base.push(part),
+            Component::Prefix(prefix) => base.push(prefix.as_os_str()),
+            Component::CurDir | Component::ParentDir | Component::RootDir => {}
+        }
+    }
+    base
 }
 
 fn binary_path() -> PathBuf {
@@ -271,6 +302,98 @@ fn cold_start_exposes_basic_toolset_and_binding_surface() -> TestResult {
     let rebound_health = harness.call_tool(5, "system.health", json!({}))?;
     assert_tool_ok(&rebound_health);
     assert_eq!(tool_content(&rebound_health)["bound"].as_bool(), Some(true));
+    Ok(())
+}
+
+#[test]
+fn linked_worktree_binding_uses_git_common_dir_identity() -> TestResult {
+    let primary_root = temp_project_root("linked_worktree")?;
+    let linked_root = primary_root.join(".worktrees").join("touching-demands");
+    let state_home = primary_root.join("state-home");
+    must(fs::create_dir_all(&state_home), "create state home")?;
+    install_linked_worktree_gitdir(&primary_root, &linked_root)?;
+    let legacy_issue_path = state_path_for(&state_home, &linked_root)
+        .join("issues")
+        .join("feature")
+        .join("legacy-worktree.md");
+    must_some(legacy_issue_path.parent(), "legacy issue parent")
+        .and_then(|parent| must(fs::create_dir_all(parent), "create legacy issue parent"))?;
+    must(
+        fs::write(&legacy_issue_path, "legacy linked-worktree body"),
+        "write legacy linked-worktree issue",
+    )?;
+
+    let mut harness = McpHarness::spawn(None, &state_home, &[])?;
+    let _ = harness.initialize()?;
+    harness.notify_initialized()?;
+
+    let primary_bind = harness.bind_project(2, &primary_root)?;
+    assert_tool_ok(&primary_bind);
+    let primary_state_root = must_some(
+        tool_content(&primary_bind)["state_root"]
+            .as_str()
+            .map(PathBuf::from),
+        "primary state root in bind response",
+    )?;
+
+    let save = harness.call_tool(
+        3,
+        "issue.save",
+        json!({
+            "category": "bug",
+            "slug": "common-dir",
+            "body": "linked worktrees must share the same parked issues",
+        }),
+    )?;
+    assert_tool_ok(&save);
+
+    let linked_bind = harness.bind_project(4, &linked_root)?;
+    assert_tool_ok(&linked_bind);
+    assert_eq!(
+        tool_content(&linked_bind)["project_root"].as_str(),
+        Some(primary_root.display().to_string().as_str())
+    );
+    assert_eq!(
+        tool_content(&linked_bind)["worktree_root"].as_str(),
+        Some(linked_root.display().to_string().as_str())
+    );
+    assert_eq!(
+        tool_content(&linked_bind)["state_root"].as_str(),
+        Some(primary_state_root.display().to_string().as_str())
+    );
+    assert_eq!(tool_content(&linked_bind)["issue_count"].as_u64(), Some(2));
+    assert!(
+        !primary_state_root
+            .display()
+            .to_string()
+            .contains(".worktrees"),
+        "state root should be keyed by git common dir identity, not linked worktree spelling"
+    );
+    assert!(!legacy_issue_path.exists());
+    assert_eq!(
+        must(
+            fs::read_to_string(
+                primary_state_root
+                    .join("issues")
+                    .join("feature")
+                    .join("legacy-worktree.md"),
+            ),
+            "read migrated legacy issue",
+        )?,
+        "legacy linked-worktree body"
+    );
+
+    let list = harness.call_tool(5, "issue.list", json!({}))?;
+    assert_tool_ok(&list);
+    assert_eq!(tool_content(&list)["count"].as_u64(), Some(2));
+    let slugs = tool_content(&list)["issues"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|issue| issue["slug"].as_str())
+        .collect::<Vec<_>>();
+    assert!(slugs.contains(&"common-dir"));
+    assert!(slugs.contains(&"legacy-worktree"));
     Ok(())
 }
 

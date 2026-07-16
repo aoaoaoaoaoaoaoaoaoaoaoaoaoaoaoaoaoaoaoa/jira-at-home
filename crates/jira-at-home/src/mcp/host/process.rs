@@ -15,6 +15,8 @@ use crate::mcp::protocol::{
 pub(super) struct ProjectBinding {
     pub(super) requested_path: PathBuf,
     pub(super) project_root: PathBuf,
+    pub(super) worktree_root: PathBuf,
+    pub(super) state_identity: PathBuf,
     pub(super) issues_root: PathBuf,
     pub(super) state_root: PathBuf,
 }
