@@ -424,7 +424,7 @@ checksum = "b5b646652bf6661599e1da8901b3b9522896f01e736bad5f723fe7a3a27f899d"
 [[package]]
 name = "libmcp"
 version = "2.1.0"
-source = "git+https://git.swarm.moe/libmcp.git?rev=b0f27d48a6a7c43e193082f601b01b02f08da831#b0f27d48a6a7c43e193082f601b01b02f08da831"
+source = "git+https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/libmcp.git?rev=b0f27d48a6a7c43e193082f601b01b02f08da831#b0f27d48a6a7c43e193082f601b01b02f08da831"
 dependencies = [
  "libmcp-derive",
  "rustix",
@@ -442,7 +442,7 @@ dependencies = [
 [[package]]
 name = "libmcp-derive"
 version = "2.1.0"
-source = "git+https://git.swarm.moe/libmcp.git?rev=b0f27d48a6a7c43e193082f601b01b02f08da831#b0f27d48a6a7c43e193082f601b01b02f08da831"
+source = "git+https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/libmcp.git?rev=b0f27d48a6a7c43e193082f601b01b02f08da831#b0f27d48a6a7c43e193082f601b01b02f08da831"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -453,7 +453,7 @@ dependencies = [
 [[package]]
 name = "libmcp-testkit"
 version = "2.1.0"
-source = "git+https://git.swarm.moe/libmcp.git?rev=b0f27d48a6a7c43e193082f601b01b02f08da831#b0f27d48a6a7c43e193082f601b01b02f08da831"
+source = "git+https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/libmcp.git?rev=b0f27d48a6a7c43e193082f601b01b02f08da831#b0f27d48a6a7c43e193082f601b01b02f08da831"
 dependencies = [
  "libmcp",
  "serde",
