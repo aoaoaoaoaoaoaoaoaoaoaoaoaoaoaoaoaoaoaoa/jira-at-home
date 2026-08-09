@@ -1,0 +1,11 @@
+schema = 1
+name = "jira-at-home"
+package = "jira-at-home"
+binary = "jira-at-home"
+arguments = ["mcp", "serve"]
+gate = ["./check.py", "check"]
+
+[state]
+mode = "versioned"
+readable = [1]
+writable = 1

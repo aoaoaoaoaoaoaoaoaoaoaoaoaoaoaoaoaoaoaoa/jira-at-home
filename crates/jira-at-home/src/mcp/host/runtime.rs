@@ -1,22 +1,19 @@
-use std::io::{self, BufReader, Write};
-#[cfg(unix)]
-use std::os::unix::process::CommandExt;
+use std::io::{self, Write};
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use libmcp::{
-    DispatchQueueOutcome, FrameLimit, FrameParseError, FrameReadOutcome, FramedMessage, Generation,
-    HostRejection, HostSessionKernel, ReplayBudget, ReplayContract, RequestId, RolloutState,
-    RpcEnvelopeKind, SessionPhase, SnapshotLimits, TelemetryFlushPolicy, TelemetryLog, ToolOutcome,
-    load_snapshot_file_from_env, read_frame_blocking, write_snapshot_file,
+    DispatchQueueOutcome, FrameLimit, FrameParseError, FramedMessage, Generation, HandoffOutcome,
+    HostRejection, HostSessionKernel, ReleaseRuntime, ReplayBudget, ReplayContract, RequestId,
+    RolloutState, RpcEnvelopeKind, SessionPhase, SnapshotLimits, TelemetryFlushPolicy,
+    TelemetryLog, TimedFrameReadOutcome, TimedFrameReader, ToolOutcome,
+    load_snapshot_file_from_env, write_snapshot_file,
 };
 use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::mcp::catalog::{DispatchTarget, tool_definitions, tool_spec};
 use crate::mcp::fault::{FaultRecord, FaultStage};
-use crate::mcp::host::binary::BinaryRuntime;
 use crate::mcp::host::process::{ProjectBinding, WorkerSupervisor};
 use crate::mcp::output::{
     ToolOutput, fallback_detailed_tool_output, split_presentation, tool_success,
@@ -33,46 +30,53 @@ const HOST_SNAPSHOT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const PENDING_CAPACITY: usize = 1;
 const RECOVERY_QUEUE_CAPACITY: usize = 1;
 const MAX_REPLAY_ATTEMPTS: u8 = 1;
+const HOST_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const HOST_HANDOFF_TIMEOUT: Duration = Duration::from_secs(15);
+const HOST_ROLLOUT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 pub(crate) fn run_host(initial_project: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
-    let mut stdin = BufReader::new(stdin.lock());
+    let mut stdin = TimedFrameReader::new(stdin.lock(), FrameLimit::DEFAULT);
     let mut stdout = io::stdout().lock();
     let mut host = HostRuntime::new(initial_project)?;
+    host.release.admit_successor()?;
 
-    while let FrameReadOutcome::Frame(payload) =
-        read_frame_blocking(&mut stdin, FrameLimit::DEFAULT)?
-    {
-        let maybe_response = host.handle_payload(payload);
-        if let Some(response) = maybe_response {
-            write_message(&mut stdout, &response)?;
+    loop {
+        match stdin.read_frame(HOST_CONTROL_POLL_INTERVAL)? {
+            TimedFrameReadOutcome::Frame(payload) => {
+                if let Some(response) = host.handle_payload(payload) {
+                    write_message(&mut stdout, &response)?;
+                }
+            }
+            TimedFrameReadOutcome::EndOfStream => return Ok(()),
+            TimedFrameReadOutcome::TimedOut => {}
         }
-        host.maybe_roll_forward()?;
+        if !stdin.has_buffered_input() && host.maybe_roll_forward() {
+            return Ok(());
+        }
     }
-
-    Ok(())
 }
 
 struct HostRuntime {
-    initial_project: Option<PathBuf>,
     binding: Option<ProjectBinding>,
     session_kernel: HostSessionKernel,
     telemetry: ServerTelemetry,
     telemetry_log: Option<TelemetryLog>,
     next_request_id: u64,
     worker: WorkerSupervisor,
-    binary: BinaryRuntime,
+    release: ReleaseRuntime,
     force_rollout_key: Option<String>,
     force_rollout_consumed: bool,
     rollout_requested: bool,
     crash_once_key: Option<String>,
     crash_once_consumed: bool,
+    rollout_retry_not_before: Option<Instant>,
 }
 
 impl HostRuntime {
     fn new(initial_project: Option<PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
         let executable = std::env::current_exe()?;
-        let binary = BinaryRuntime::new(executable.clone())?;
+        let release = ReleaseRuntime::discover(SERVER_NAME)?;
         let restored = restore_host_state()?;
         let session_kernel = if let Some(seed) = restored.as_ref() {
             let limits = SnapshotLimits::try_new(
@@ -125,19 +129,19 @@ impl HostRuntime {
         }
 
         Ok(Self {
-            initial_project,
             binding,
             session_kernel,
             telemetry,
             telemetry_log,
             next_request_id,
             worker,
-            binary,
+            release,
             force_rollout_key: std::env::var(FORCE_ROLLOUT_ENV).ok(),
             force_rollout_consumed,
             rollout_requested: false,
             crash_once_key: std::env::var(CRASH_ONCE_ENV).ok(),
             crash_once_consumed,
+            rollout_retry_not_before: None,
         })
     }
 
@@ -552,9 +556,14 @@ impl HostRuntime {
                 )
             }
             "system.health" => {
-                let rollout = if self.binary.rollout_pending().map_err(|error| {
-                    FaultRecord::rollout(generation, &operation, error.to_string())
-                })? {
+                let rollout = if self
+                    .release
+                    .observe()
+                    .map_err(|error| {
+                        FaultRecord::rollout(generation, &operation, error.to_string())
+                    })?
+                    .rollout_pending()
+                {
                     RolloutState::Pending
                 } else {
                     RolloutState::Stable
@@ -566,7 +575,7 @@ impl HostRuntime {
                         &health,
                         self.binding.as_ref(),
                         worker_alive,
-                        self.binary.launch_path_stable,
+                        self.release.launch_path_stable(),
                         generation,
                     )?,
                     presentation,
@@ -645,18 +654,45 @@ impl HostRuntime {
         Ok(id)
     }
 
-    fn maybe_roll_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let binary_pending = self.binary.rollout_pending()?;
-        if !self.rollout_requested && !binary_pending {
-            return Ok(());
+    fn maybe_roll_forward(&mut self) -> bool {
+        if self
+            .rollout_retry_not_before
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return false;
         }
-        if binary_pending && !self.rollout_requested {
+        self.rollout_retry_not_before = None;
+        let observation = match self.release.observe() {
+            Ok(observation) => observation,
+            Err(error) => {
+                self.defer_rollout(error);
+                return false;
+            }
+        };
+        if self.rollout_requested
+            && !observation.rollout_ready()
+            && let Err(error) = self.release.arm_current_relaunch()
+        {
+            self.defer_rollout(error);
+            return false;
+        }
+        if !self.rollout_requested && !observation.rollout_ready() {
+            return false;
+        }
+        if observation.rollout_ready() && !self.rollout_requested {
             self.telemetry.record_rollout();
         }
-        self.roll_forward()
+        match self.roll_forward() {
+            Ok(HandoffOutcome::Relinquish) => true,
+            Ok(HandoffOutcome::Retained) => false,
+            Err(error) => {
+                self.defer_rollout(error);
+                false
+            }
+        }
     }
 
-    fn roll_forward(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn roll_forward(&self) -> Result<HandoffOutcome, Box<dyn std::error::Error>> {
         let state = HostStateSeed {
             session_kernel: self.session_kernel.snapshot(),
             telemetry: self.telemetry.clone(),
@@ -668,24 +704,14 @@ impl HostRuntime {
             crash_once_consumed: self.crash_once_consumed,
         };
         let state_capsule = write_snapshot_file("jira-at-home-mcp-host-reexec", &state)?;
-        let mut command = Command::new(&self.binary.path);
-        let _ = command.arg("mcp").arg("serve");
-        if let Some(project) = self.initial_project.as_ref() {
-            let _ = command.arg("--project").arg(project);
-        }
-        let _ = command.env(HOST_STATE_ENV, state_capsule.path());
-        #[cfg(unix)]
-        {
-            let error = command.exec();
-            Err(Box::new(error))
-        }
-        #[cfg(not(unix))]
-        {
-            Err(Box::new(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "host rollout requires unix exec support",
-            )))
-        }
+        Ok(self
+            .release
+            .handoff(HOST_STATE_ENV, state_capsule.path(), HOST_HANDOFF_TIMEOUT)?)
+    }
+
+    fn defer_rollout(&mut self, error: impl std::fmt::Display) {
+        self.rollout_retry_not_before = Instant::now().checked_add(HOST_ROLLOUT_RETRY_DELAY);
+        eprintln!("jira-at-home MCP rollout retained incumbent: {error}");
     }
 
     fn should_force_rollout(&self, operation: &str) -> bool {
@@ -1114,7 +1140,7 @@ fn write_message(stdout: &mut impl Write, message: &Value) -> io::Result<()> {
     write_sync_json_frame(stdout, message, FrameLimit::DEFAULT)
 }
 
-fn elapsed_ms(duration: std::time::Duration) -> u64 {
+fn elapsed_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 

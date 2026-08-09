@@ -32,3 +32,6 @@ Run:
 ```bash
 cargo run -- mcp serve --project .
 ```
+
+The checked-in `.mcp-depot.toml` optionally enables eager immutable releases
+and readiness-gated live handoff. It does not alter the standalone path above.
