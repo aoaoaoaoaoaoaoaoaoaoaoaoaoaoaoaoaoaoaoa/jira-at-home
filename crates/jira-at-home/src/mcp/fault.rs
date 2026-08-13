@@ -225,11 +225,23 @@ impl FaultRecord {
         self.fault.detail.as_str()
     }
 
+    fn rendered_message(&self) -> String {
+        format!(
+            "{}\nfault={} stage={} operation={} retryable={} retried={}",
+            self.message(),
+            self.fault.code.as_str(),
+            format!("{:?}", self.stage).to_ascii_lowercase(),
+            self.operation,
+            self.retryable,
+            self.retried,
+        )
+    }
+
     pub(crate) fn error_detail(&self) -> ToolErrorDetail {
         ToolErrorDetail {
             code: Some(self.jsonrpc_code),
             kind: Some(self.fault.code.as_str().to_owned()),
-            message: Some(self.message().to_owned()),
+            message: Some(self.rendered_message()),
         }
     }
 
@@ -242,12 +254,12 @@ impl FaultRecord {
     }
 
     pub(crate) fn into_tool_result(self) -> Value {
+        let rendered_message = self.rendered_message();
         json!({
             "content": [{
                 "type": "text",
-                "text": self.message(),
+                "text": rendered_message,
             }],
-            "structuredContent": self,
             "isError": true,
         })
     }

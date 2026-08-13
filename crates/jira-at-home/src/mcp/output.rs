@@ -116,10 +116,10 @@ pub(crate) fn projected_tool_output(
 ) -> Result<ToolOutput, FaultRecord> {
     let concise = projection
         .concise_projection()
-        .map_err(|error| projection_fault(error, generation, stage, operation))?;
+        .map_err(|error| projection_fault(&error, generation, stage, operation))?;
     let full = projection
         .full_projection()
-        .map_err(|error| projection_fault(error, generation, stage, operation))?;
+        .map_err(|error| projection_fault(&error, generation, stage, operation))?;
     Ok(ToolOutput::from_values(
         concise,
         full,
@@ -139,7 +139,7 @@ pub(crate) fn fallback_detailed_tool_output(
     operation: &str,
 ) -> Result<ToolOutput, FaultRecord> {
     let projection = FallbackJsonProjection::new(concise, full, kind)
-        .map_err(|error| projection_fault(error, generation, stage, operation))?;
+        .map_err(|error| projection_fault(&error, generation, stage, operation))?;
     projected_tool_output(
         &projection,
         concise_text,
@@ -150,28 +150,22 @@ pub(crate) fn fallback_detailed_tool_output(
     )
 }
 
-pub(crate) fn tool_success(
-    output: ToolOutput,
-    presentation: Presentation,
-    generation: libmcp::Generation,
-    stage: FaultStage,
-    operation: &str,
-) -> Result<Value, FaultRecord> {
+pub(crate) fn tool_success(output: &ToolOutput, presentation: Presentation) -> Value {
     let structured = output.structured(presentation.detail).clone();
-    let text = match presentation.render {
-        RenderMode::Porcelain => output.porcelain_text(presentation.detail),
-        RenderMode::Json => serde_json::to_string_pretty(&structured).map_err(|error| {
-            FaultRecord::internal(generation, stage, operation, error.to_string())
-        })?,
-    };
-    Ok(json!({
-        "content": [{
-            "type": "text",
-            "text": text,
-        }],
-        "structuredContent": structured,
-        "isError": false,
-    }))
+    match presentation.render {
+        RenderMode::Porcelain => json!({
+            "content": [{
+                "type": "text",
+                "text": output.porcelain_text(presentation.detail),
+            }],
+            "isError": false,
+        }),
+        RenderMode::Json => json!({
+            "content": [],
+            "structuredContent": structured,
+            "isError": false,
+        }),
+    }
 }
 
 pub(crate) fn with_common_presentation(schema: Value) -> Value {
@@ -179,7 +173,7 @@ pub(crate) fn with_common_presentation(schema: Value) -> Value {
 }
 
 fn projection_fault(
-    error: ProjectionError,
+    error: &ProjectionError,
     generation: libmcp::Generation,
     stage: FaultStage,
     operation: &str,

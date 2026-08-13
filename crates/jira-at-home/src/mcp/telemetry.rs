@@ -27,11 +27,11 @@ impl Default for ServerTelemetry {
 
 impl ServerTelemetry {
     pub(crate) fn record_request(&mut self, operation: &str) {
-        exact(self.ledger.record_request(method(operation)));
+        exact(&self.ledger.record_request(method(operation)));
     }
 
     pub(crate) fn record_success(&mut self, operation: &str, latency_ms: u64) {
-        exact(self.ledger.record_success(&method(operation), latency_ms));
+        exact(&self.ledger.record_success(&method(operation), latency_ms));
     }
 
     pub(crate) fn record_error(&mut self, operation: &str, fault: &FaultRecord, latency_ms: u64) {
@@ -45,22 +45,23 @@ impl ServerTelemetry {
             self.ledger
                 .record_error(&method, latency_ms, fault.message())
         };
-        exact(result);
+        exact(&result);
     }
 
     pub(crate) fn record_recovery_fault(&mut self, operation: &str, fault: &FaultRecord) {
         exact(
-            self.ledger
+            &self
+                .ledger
                 .record_recovery_fault(Some(&method(operation)), fault.fault.clone()),
         );
     }
 
     pub(crate) fn record_replay(&mut self, operation: &str) {
-        exact(self.ledger.record_replay(&method(operation)));
+        exact(&self.ledger.record_replay(&method(operation)));
     }
 
     pub(crate) fn replace_worker(&mut self, generation: Generation) {
-        exact(self.ledger.replace_worker(generation));
+        exact(&self.ledger.replace_worker(generation));
     }
 
     pub(crate) fn record_rollout(&mut self) {
@@ -137,7 +138,7 @@ fn method(operation: &str) -> RpcMethod {
     })
 }
 
-fn exact(result: Result<(), libmcp::OperationalMetricError>) {
+fn exact(result: &Result<(), libmcp::OperationalMetricError>) {
     if result.is_err() {
         std::process::abort();
     }

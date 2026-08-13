@@ -1,4 +1,7 @@
+# Non-versioned on purpose: use the active system rustup channel, not a stale
+# Rust version copied from another project.
+
 [toolchain]
-channel = "1.94.0"
+channel = "stable"
 profile = "minimal"
 components = ["clippy", "rustfmt"]

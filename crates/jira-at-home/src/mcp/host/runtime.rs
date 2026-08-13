@@ -1,5 +1,5 @@
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use libmcp::{
@@ -34,7 +34,7 @@ const HOST_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HOST_HANDOFF_TIMEOUT: Duration = Duration::from_secs(15);
 const HOST_ROLLOUT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
-pub(crate) fn run_host(initial_project: Option<PathBuf>) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_host(initial_project: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let mut stdin = TimedFrameReader::new(stdin.lock(), FrameLimit::DEFAULT);
     let mut stdout = io::stdout().lock();
@@ -74,7 +74,7 @@ struct HostRuntime {
 }
 
 impl HostRuntime {
-    fn new(initial_project: Option<PathBuf>) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new(initial_project: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let executable = std::env::current_exe()?;
         let release = ReleaseRuntime::discover(SERVER_NAME)?;
         let restored = restore_host_state()?;
@@ -105,9 +105,9 @@ impl HostRuntime {
         let crash_once_consumed = restored
             .as_ref()
             .is_some_and(|seed| seed.crash_once_consumed);
-        let binding = if let Some(seed) = restored.as_ref().and_then(|seed| seed.binding.clone()) {
+        let binding = if let Some(seed) = restored.as_ref().and_then(|seed| seed.binding.as_ref()) {
             Some(restore_binding(seed)?)
-        } else if let Some(path) = initial_project.clone() {
+        } else if let Some(path) = initial_project {
             Some(resolve_project_binding(path)?.binding)
         } else {
             None
@@ -150,7 +150,7 @@ impl HostRuntime {
             Ok(frame) => frame,
             Err(FrameParseError::InvalidJson(error)) => {
                 return Some(jsonrpc_error(
-                    Value::Null,
+                    &Value::Null,
                     FaultRecord::parse_error(
                         self.worker.generation(),
                         "jsonrpc.parse",
@@ -160,7 +160,7 @@ impl HostRuntime {
             }
             Err(error) => {
                 return Some(jsonrpc_error(
-                    Value::Null,
+                    &Value::Null,
                     FaultRecord::invalid_request(
                         self.worker.generation(),
                         "jsonrpc.request",
@@ -169,10 +169,10 @@ impl HostRuntime {
                 ));
             }
         };
-        self.handle_frame(frame)
+        self.handle_frame(&frame)
     }
 
-    fn handle_frame(&mut self, frame: FramedMessage) -> Option<Value> {
+    fn handle_frame(&mut self, frame: &FramedMessage) -> Option<Value> {
         let (request_id, method) = match frame.classify() {
             RpcEnvelopeKind::Request { id, method } => (Some(id), method),
             RpcEnvelopeKind::Notification { method } => (None, method),
@@ -187,7 +187,7 @@ impl HostRuntime {
         self.telemetry.record_request(&operation_key);
         let admission = self
             .session_kernel
-            .observe_client_frame(&frame)
+            .observe_client_frame(frame)
             .map_err(|rejection| {
                 FaultRecord::host_rejection(
                     self.worker.generation(),
@@ -200,7 +200,7 @@ impl HostRuntime {
                 if request_id.is_some() && !worker_dispatch(method.as_str(), &params) {
                     self.session_kernel
                         .begin_request_dispatch(
-                            &frame,
+                            frame,
                             replay_contract(method.as_str(), &params),
                             PENDING_CAPACITY,
                         )
@@ -218,24 +218,24 @@ impl HostRuntime {
                 }
             });
         let dispatched =
-            admission.and_then(|()| self.dispatch(&frame, method.as_str(), params, id.clone()));
+            admission.and_then(|()| self.dispatch(frame, method.as_str(), params, id.clone()));
         let response = match dispatched {
             Ok(Some(result)) => {
                 let latency_ms = elapsed_ms(started_at.elapsed());
                 self.telemetry.record_success(&operation_key, latency_ms);
                 self.record_tool_completion_from_frame(
-                    &frame,
+                    frame,
                     request_id.as_ref(),
                     latency_ms,
                     None,
                 );
-                id.map(|id| jsonrpc_result(id, result))
+                id.map(|id| jsonrpc_result(&id, &result))
             }
             Ok(None) => {
                 let latency_ms = elapsed_ms(started_at.elapsed());
                 self.telemetry.record_success(&operation_key, latency_ms);
                 self.record_tool_completion_from_frame(
-                    &frame,
+                    frame,
                     request_id.as_ref(),
                     latency_ms,
                     None,
@@ -247,14 +247,14 @@ impl HostRuntime {
                 self.telemetry
                     .record_error(&operation_key, &fault, latency_ms);
                 self.record_tool_completion_from_frame(
-                    &frame,
+                    frame,
                     request_id.as_ref(),
                     latency_ms,
                     Some(&fault),
                 );
                 id.map(|id| match method.as_str() {
-                    "tools/call" => jsonrpc_result(id, fault.into_tool_result()),
-                    _ => jsonrpc_error(id, fault),
+                    "tools/call" => jsonrpc_result(&id, &fault.into_tool_result()),
+                    _ => jsonrpc_error(&id, fault),
                 })
             }
         };
@@ -359,7 +359,7 @@ impl HostRuntime {
         let operation = format!("tools/call:{}", spec.name);
         self.dispatch_worker_operation(
             request_frame,
-            operation,
+            &operation,
             spec.replay,
             WorkerOperation::CallTool {
                 name: spec.name.to_owned(),
@@ -371,14 +371,14 @@ impl HostRuntime {
     fn dispatch_worker_operation(
         &mut self,
         request_frame: &FramedMessage,
-        operation: String,
+        operation: &str,
         replay: ReplayContract,
         worker_operation: WorkerOperation,
     ) -> Result<Value, FaultRecord> {
-        let binding = self.require_bound_project(&operation)?;
+        let binding = self.require_bound_project(operation)?;
         self.worker.rebind(binding.worktree_root.clone());
 
-        if self.should_crash_worker_once(&operation) {
+        if self.should_crash_worker_once(operation) {
             self.worker.arm_crash_once();
         }
 
@@ -394,11 +394,11 @@ impl HostRuntime {
                 FaultRecord::host_rejection(
                     self.worker.generation(),
                     FaultStage::Host,
-                    &operation,
+                    operation,
                     rejection,
                 )
             })?;
-        let host_request_id = self.allocate_request_id(&operation)?;
+        let host_request_id = self.allocate_request_id(operation)?;
         match self
             .worker
             .execute(host_request_id, worker_operation.clone())
@@ -406,7 +406,7 @@ impl HostRuntime {
             Ok(result) => Ok(result),
             Err(fault) => {
                 if replay == ReplayContract::Convergent && fault.retryable {
-                    self.telemetry.record_recovery_fault(&operation, &fault);
+                    self.telemetry.record_recovery_fault(operation, &fault);
                     let recovery = self
                         .session_kernel
                         .requeue_pending_for_replay(ReplayBudget {
@@ -417,13 +417,11 @@ impl HostRuntime {
                         return Err(FaultRecord::host_rejection(
                             self.worker.generation(),
                             FaultStage::Host,
-                            &operation,
+                            operation,
                             rejected.reason,
                         ));
                     }
-                    self.worker
-                        .restart()
-                        .map_err(|restart_fault| restart_fault.mark_retried())?;
+                    self.worker.restart().map_err(FaultRecord::mark_retried)?;
                     self.telemetry.replace_worker(self.worker.generation());
                     let dispatch =
                         self.session_kernel
@@ -432,7 +430,7 @@ impl HostRuntime {
                                 FaultRecord::host_rejection(
                                     self.worker.generation(),
                                     FaultStage::Host,
-                                    &operation,
+                                    operation,
                                     rejection,
                                 )
                             })?;
@@ -440,7 +438,7 @@ impl HostRuntime {
                         return Err(FaultRecord::internal(
                             self.worker.generation(),
                             FaultStage::Host,
-                            &operation,
+                            operation,
                             "recovery kernel did not authorize the scheduled replay",
                         ));
                     };
@@ -448,15 +446,15 @@ impl HostRuntime {
                         return Err(FaultRecord::internal(
                             self.worker.generation(),
                             FaultStage::Host,
-                            &operation,
+                            operation,
                             "recovery kernel returned a divergent replay frame",
                         ));
                     }
-                    self.telemetry.record_replay(&operation);
+                    self.telemetry.record_replay(operation);
                     match self.worker.execute(host_request_id, worker_operation) {
                         Err(replay_fault) if replay_fault.retryable => {
                             self.telemetry
-                                .record_recovery_fault(&operation, &replay_fault);
+                                .record_recovery_fault(operation, &replay_fault);
                             let recovery =
                                 self.session_kernel
                                     .requeue_pending_for_replay(ReplayBudget {
@@ -467,14 +465,14 @@ impl HostRuntime {
                                 return Err(FaultRecord::internal(
                                     self.worker.generation(),
                                     FaultStage::Host,
-                                    &operation,
+                                    operation,
                                     "recovery kernel accepted a replay beyond the attempt budget",
                                 ));
                             };
                             Err(FaultRecord::host_rejection(
                                 self.worker.generation(),
                                 FaultStage::Host,
-                                &operation,
+                                operation,
                                 rejected.reason,
                             )
                             .mark_retried())
@@ -483,7 +481,7 @@ impl HostRuntime {
                         Ok(result) => Ok(result),
                     }
                 } else if fault.retryable {
-                    self.telemetry.record_recovery_fault(&operation, &fault);
+                    self.telemetry.record_recovery_fault(operation, &fault);
                     let recovery = self
                         .session_kernel
                         .requeue_pending_for_replay(ReplayBudget {
@@ -499,12 +497,12 @@ impl HostRuntime {
                         Ok(()) => self.telemetry.replace_worker(self.worker.generation()),
                         Err(restart_fault) => self
                             .telemetry
-                            .record_recovery_fault(&operation, &restart_fault),
+                            .record_recovery_fault(operation, &restart_fault),
                     }
                     Err(FaultRecord::host_rejection(
                         self.worker.generation(),
                         FaultStage::Host,
-                        &operation,
+                        operation,
                         rejection,
                     ))
                 } else {
@@ -526,15 +524,14 @@ impl HostRuntime {
                     "tools/call:project.bind",
                     generation,
                 )?;
-                let resolved =
-                    resolve_project_binding(PathBuf::from(args.path)).map_err(|error| {
-                        FaultRecord::invalid_input(
-                            generation,
-                            FaultStage::Host,
-                            "tools/call:project.bind",
-                            error.to_string(),
-                        )
-                    })?;
+                let resolved = resolve_project_binding(Path::new(&args.path)).map_err(|error| {
+                    FaultRecord::invalid_input(
+                        generation,
+                        FaultStage::Host,
+                        "tools/call:project.bind",
+                        error.to_string(),
+                    )
+                })?;
                 self.worker
                     .refresh_binding(resolved.binding.worktree_root.clone());
                 self.telemetry_log =
@@ -547,13 +544,8 @@ impl HostRuntime {
                         )
                     })?);
                 self.binding = Some(resolved.binding);
-                tool_success(
-                    project_bind_output(&resolved.status, generation)?,
-                    presentation,
-                    generation,
-                    FaultStage::Host,
-                    "tools/call:project.bind",
-                )
+                let output = project_bind_output(&resolved.status, generation)?;
+                Ok(tool_success(&output, presentation))
             }
             "system.health" => {
                 let rollout = if self
@@ -570,36 +562,26 @@ impl HostRuntime {
                 };
                 let worker_alive = self.worker.is_alive();
                 let health = self.telemetry.health_snapshot(rollout, worker_alive);
-                tool_success(
-                    system_health_output(
-                        &health,
-                        self.binding.as_ref(),
-                        worker_alive,
-                        self.release.launch_path_stable(),
-                        generation,
-                    )?,
-                    presentation,
+                let output = system_health_output(
+                    &health,
+                    self.binding.as_ref(),
+                    worker_alive,
+                    self.release.launch_path_stable(),
                     generation,
-                    FaultStage::Host,
-                    &operation,
-                )
+                )?;
+                Ok(tool_success(&output, presentation))
             }
             "system.telemetry" => {
                 let worker_alive = self.worker.is_alive();
                 let snapshot = self.telemetry.telemetry_snapshot(worker_alive);
                 let hot_methods = self.telemetry.ranked_methods(worker_alive);
-                tool_success(
-                    system_telemetry_output(
-                        &snapshot,
-                        &hot_methods,
-                        self.telemetry.host_rollouts(),
-                        generation,
-                    )?,
-                    presentation,
+                let output = system_telemetry_output(
+                    &snapshot,
+                    &hot_methods,
+                    self.telemetry.host_rollouts(),
                     generation,
-                    FaultStage::Host,
-                    &operation,
-                )
+                )?;
+                Ok(tool_success(&output, presentation))
             }
             other => Err(FaultRecord::invalid_input(
                 generation,
@@ -801,14 +783,14 @@ struct ProjectBindStatus {
 }
 
 fn resolve_project_binding(
-    requested_path: PathBuf,
+    requested_path: &Path,
 ) -> Result<ResolvedProjectBinding, Box<dyn std::error::Error>> {
-    let store = IssueStore::bind(requested_path.clone())?;
+    let store = IssueStore::bind(requested_path)?;
     let layout = store.layout().clone();
     let status = store.status()?;
     Ok(ResolvedProjectBinding {
         binding: ProjectBinding {
-            requested_path: requested_path.clone(),
+            requested_path: requested_path.to_owned(),
             project_root: layout.project_root.clone(),
             worktree_root: layout.worktree_root.clone(),
             state_identity: layout.state_identity.clone(),
@@ -827,8 +809,10 @@ fn resolve_project_binding(
     })
 }
 
-fn restore_binding(seed: ProjectBindingSeed) -> Result<ProjectBinding, Box<dyn std::error::Error>> {
-    Ok(resolve_project_binding(seed.requested_path)?.binding)
+fn restore_binding(
+    seed: &ProjectBindingSeed,
+) -> Result<ProjectBinding, Box<dyn std::error::Error>> {
+    Ok(resolve_project_binding(&seed.requested_path)?.binding)
 }
 
 fn restore_host_state() -> Result<Option<HostStateSeed>, Box<dyn std::error::Error>> {
@@ -1120,7 +1104,7 @@ fn complete_public_response(kernel: &mut HostSessionKernel, response: &Value) {
     }
 }
 
-fn jsonrpc_result(id: Value, result: Value) -> Value {
+fn jsonrpc_result(id: &Value, result: &Value) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -1128,7 +1112,7 @@ fn jsonrpc_result(id: Value, result: Value) -> Value {
     })
 }
 
-fn jsonrpc_error(id: Value, fault: FaultRecord) -> Value {
+fn jsonrpc_error(id: &Value, fault: FaultRecord) -> Value {
     json!({
         "jsonrpc": "2.0",
         "id": id,

@@ -56,7 +56,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
     match cli.command {
         Command::Mcp { command } => match command {
-            McpCommand::Serve(args) => mcp::run_host(args.project)?,
+            McpCommand::Serve(args) => mcp::run_host(args.project.as_deref())?,
             McpCommand::Worker(args) => mcp::run_worker(args.project, args.generation)?,
         },
     }

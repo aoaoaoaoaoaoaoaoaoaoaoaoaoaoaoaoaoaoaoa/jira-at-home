@@ -139,13 +139,7 @@ impl WorkerService {
                 ));
             }
         };
-        tool_success(
-            output,
-            presentation,
-            self.generation,
-            FaultStage::Worker,
-            &operation,
-        )
+        Ok(tool_success(&output, presentation))
     }
 }
 
@@ -205,6 +199,9 @@ fn store_fault(
             | StoreError::MissingProjectPath(_)
             | StoreError::ProjectPathNotDirectory(_) => {
                 FaultRecord::invalid_input(generation, stage, operation, error.to_string())
+            }
+            StoreError::IssueTooLarge(_, _) => {
+                FaultRecord::unavailable(generation, stage, operation, error.to_string())
             }
             StoreError::Io(_) => {
                 FaultRecord::internal(generation, stage, operation, error.to_string())

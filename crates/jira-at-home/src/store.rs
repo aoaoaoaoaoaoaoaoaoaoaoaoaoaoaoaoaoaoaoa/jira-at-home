@@ -318,7 +318,8 @@ impl IssueStore {
             return Err(StoreError::IssueNotFound(key.to_string()));
         }
         let metadata = fs::metadata(&path)?;
-        let bytes = metadata.len() as usize;
+        let bytes = usize::try_from(metadata.len())
+            .map_err(|_| StoreError::IssueTooLarge(key.to_string(), metadata.len()))?;
         fs::remove_file(&path)?;
         Ok(DeleteReceipt {
             key,
@@ -331,6 +332,8 @@ impl IssueStore {
 
 #[derive(Debug, Error)]
 pub(crate) enum StoreError {
+    #[error("issue `{0}` is too large for this platform ({1} bytes)")]
+    IssueTooLarge(String, u64),
     #[error("project path `{0}` does not exist")]
     MissingProjectPath(String),
     #[error("project path `{0}` does not resolve to a directory")]

@@ -111,7 +111,7 @@ impl McpHarness {
     }
 
     fn initialize(&mut self) -> TestResult<Value> {
-        self.request(json!({
+        self.request(&json!({
             "jsonrpc": "2.0",
             "id": 1,
             "method": "initialize",
@@ -124,14 +124,14 @@ impl McpHarness {
     }
 
     fn notify_initialized(&mut self) -> TestResult {
-        self.notify(json!({
+        self.notify(&json!({
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
         }))
     }
 
     fn tools_list(&mut self) -> TestResult<Value> {
-        self.request(json!({
+        self.request(&json!({
             "jsonrpc": "2.0",
             "id": 2,
             "method": "tools/list",
@@ -140,33 +140,41 @@ impl McpHarness {
     }
 
     fn bind_project(&mut self, id: u64, path: &Path) -> TestResult<Value> {
-        self.call_tool(
+        self.call_tool_full(
             id,
             "project.bind",
             json!({ "path": path.display().to_string() }),
         )
     }
 
-    fn call_tool(&mut self, id: u64, name: &str, arguments: Value) -> TestResult<Value> {
-        self.request(json!({
+    fn call_tool(&mut self, id: u64, name: &str, mut arguments: Value) -> TestResult<Value> {
+        if let Some(arguments) = arguments.as_object_mut() {
+            let _ = arguments
+                .entry("render".to_owned())
+                .or_insert_with(|| Value::String("json".to_owned()));
+        }
+        let mut params = serde_json::Map::new();
+        let _ = params.insert("name".to_owned(), Value::String(name.to_owned()));
+        let _ = params.insert("arguments".to_owned(), arguments);
+        self.request(&json!({
             "jsonrpc": "2.0",
             "id": id,
             "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": arguments,
-            }
+            "params": params,
         }))
     }
 
     fn call_tool_full(&mut self, id: u64, name: &str, arguments: Value) -> TestResult<Value> {
-        let mut arguments = arguments.as_object().cloned().unwrap_or_default();
+        let mut arguments = match arguments {
+            Value::Object(arguments) => arguments,
+            _ => serde_json::Map::new(),
+        };
         let _ = arguments.insert("render".to_owned(), json!("json"));
         let _ = arguments.insert("detail".to_owned(), json!("full"));
         self.call_tool(id, name, Value::Object(arguments))
     }
 
-    fn request(&mut self, message: Value) -> TestResult<Value> {
+    fn request(&mut self, message: &Value) -> TestResult<Value> {
         let encoded = must(serde_json::to_string(&message), "request json")?;
         self.request_raw(encoded.as_bytes())
     }
@@ -183,7 +191,7 @@ impl McpHarness {
         must(serde_json::from_str(&line), "response json")
     }
 
-    fn notify(&mut self, message: Value) -> TestResult {
+    fn notify(&mut self, message: &Value) -> TestResult {
         let encoded = must(serde_json::to_string(&message), "notify json")?;
         must(writeln!(self.stdin, "{encoded}"), "write notify")?;
         must(self.stdin.flush(), "flush notify")?;
@@ -268,8 +276,10 @@ fn tool_content(response: &Value) -> &Value {
     &response["result"]["structuredContent"]
 }
 
-fn tool_fault(response: &Value) -> &Value {
-    &response["result"]["structuredContent"]
+fn tool_text(response: &Value) -> &str {
+    response["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default()
 }
 
 fn tool_names(response: &Value) -> Vec<&str> {
@@ -560,15 +570,8 @@ fn save_read_delete_roundtrip_through_state_backed_issue_dir() -> TestResult {
         }),
     )?;
     assert_tool_error(&missing);
-    assert_eq!(
-        tool_fault(&missing)["fault"]["code"].as_str(),
-        Some("invalid_input")
-    );
-    assert!(
-        tool_fault(&missing)["fault"]["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("feature/feral-machine"))
-    );
+    assert!(tool_text(&missing).contains("fault=invalid_input"));
+    assert!(tool_text(&missing).contains("feature/feral-machine"));
 
     let telemetry_path = state_root.join("mcp").join("telemetry.jsonl");
     let events = must(
@@ -649,11 +652,7 @@ fn issue_category_is_closed_and_mandatory() -> TestResult {
         }),
     )?;
     assert_tool_error(&missing_category);
-    assert!(
-        tool_fault(&missing_category)["fault"]["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("missing field `category`"))
-    );
+    assert!(tool_text(&missing_category).contains("missing field `category`"));
 
     let invalid_category = harness.call_tool(
         4,
@@ -665,11 +664,7 @@ fn issue_category_is_closed_and_mandatory() -> TestResult {
         }),
     )?;
     assert_tool_error(&invalid_category);
-    assert!(
-        tool_fault(&invalid_category)["fault"]["detail"]
-            .as_str()
-            .is_some_and(|detail| detail.contains("expected `feature` or `bug`"))
-    );
+    assert!(tool_text(&invalid_category).contains("expected `feature` or `bug`"));
     Ok(())
 }
 
@@ -753,10 +748,7 @@ fn uncertain_issue_save_is_never_replayed() -> TestResult {
         }),
     )?;
     assert_tool_error(&save);
-    assert_eq!(
-        tool_fault(&save)["fault"]["code"].as_str(),
-        Some("ambiguous_outcome")
-    );
+    assert!(tool_text(&save).contains("fault=ambiguous_outcome"));
 
     let telemetry = harness.call_tool_full(4, "system.telemetry", json!({}))?;
     assert_tool_ok(&telemetry);
