@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use libmcp as _;
-use libmcp_testkit::read_json_lines;
+use libmcp_testkit::{TestCell, read_json_lines};
 use serde as _;
 use serde_json::{Value, json};
 use thiserror as _;
@@ -25,18 +25,8 @@ fn must_some<T>(value: Option<T>, context: &str) -> TestResult<T> {
     value.ok_or_else(|| io::Error::other(context).into())
 }
 
-fn temp_project_root(name: &str) -> TestResult<PathBuf> {
-    let root = std::env::temp_dir().join(format!(
-        "jira_at_home_{name}_{}_{}",
-        std::process::id(),
-        must(
-            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH),
-            "current time after unix epoch",
-        )?
-        .as_nanos()
-    ));
-    must(fs::create_dir_all(&root), "create temp project root")?;
-    Ok(root)
+fn temp_project_root(name: &str) -> TestResult<TestCell> {
+    Ok(TestCell::new(&format!("jira-at-home-{name}-"))?)
 }
 
 fn install_linked_worktree_gitdir(primary: &Path, linked: &Path) -> TestResult {
