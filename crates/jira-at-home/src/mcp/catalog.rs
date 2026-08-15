@@ -19,6 +19,22 @@ pub(crate) struct ToolSpec {
 }
 
 impl ToolSpec {
+    fn effect_json(self) -> Value {
+        let state = if self.name == "project.bind" {
+            json!({"kind": "journaled", "key": "project"})
+        } else {
+            json!({"kind": "stateless"})
+        };
+        json!({
+            "recovery": {"kind": match self.replay {
+                ReplayContract::Convergent => "replay_safe",
+                ReplayContract::ProbeRequired => "probe_required",
+                ReplayContract::NeverReplay => "at_most_once",
+            }},
+            "state": state
+        })
+    }
+
     fn annotation_json(self) -> Value {
         json!({
             "title": self.name,
@@ -44,7 +60,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
         name: "project.bind",
         description: "Bind this MCP session to a project root or a nested path inside one.",
         dispatch: DispatchTarget::Host,
-        replay: ReplayContract::NeverReplay,
+        replay: ReplayContract::Convergent,
     },
     ToolSpec {
         name: "issue.save",
@@ -97,6 +113,7 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
                 "description": spec.description,
                 "inputSchema": tool_schema(spec.name),
                 "annotations": spec.annotation_json(),
+                "_meta": {"io.libmcp/effect": spec.effect_json()},
             })
         })
         .collect()
