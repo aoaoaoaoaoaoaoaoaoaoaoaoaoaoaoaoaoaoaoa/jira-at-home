@@ -16,7 +16,7 @@ version = "1.0.0"
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
 dirs = "6"
-libmcp = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/libmcp.git", rev = "540693847b3e2c766b0776527a520482e267ca9e" }
+libmcp = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/libmcp.git", rev = "2dae0187c71452e28b43c6b6b182e1b0fea8bba4" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 thiserror = "2.0.17"
