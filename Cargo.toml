@@ -10,7 +10,7 @@ keywords = ["mcp", "issues", "notes", "git", "project"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/jira-at-home"
-rust-version = "1.97"
+rust-version = "1.98.0"
 version = "1.0.0"
 
 [workspace.dependencies]
