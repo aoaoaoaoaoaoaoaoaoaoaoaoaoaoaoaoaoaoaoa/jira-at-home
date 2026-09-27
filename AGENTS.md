@@ -1,3 +1,3 @@
 # Project Instructions
 
-Read and follow `/home/main/programming/projects/rust_starter/docs/rust-style-doctrine.md` before meaningful Rust work.
+Load and follow `$style-doctrine` before meaningful Rust work.
