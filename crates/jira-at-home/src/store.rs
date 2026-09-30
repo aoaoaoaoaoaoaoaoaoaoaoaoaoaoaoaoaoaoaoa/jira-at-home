@@ -52,33 +52,35 @@ impl std::fmt::Display for IssueCategory {
     }
 }
 
+/// Shared shape rule for every path-segment identifier (issue slugs, epic
+/// names): lowercase ascii letters, digits, and single `-` separators.
+fn validate_segment_shape(raw: &str) -> Result<(), &'static str> {
+    if raw.is_empty() {
+        return Err("must not be empty");
+    }
+    if raw.starts_with('-') || raw.ends_with('-') {
+        return Err("must not start or end with `-`");
+    }
+    if !raw
+        .bytes()
+        .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err("must use lowercase ascii letters, digits, and `-` only");
+    }
+    if raw.split('-').any(str::is_empty) {
+        return Err("must not contain empty `-` segments");
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub(crate) struct IssueSlug(String);
 
 impl IssueSlug {
     pub(crate) fn parse(raw: impl Into<String>) -> Result<Self, StoreError> {
         let raw = raw.into();
-        if raw.is_empty() {
-            return Err(StoreError::InvalidSlug("slug must not be empty".to_owned()));
-        }
-        if raw.starts_with('-') || raw.ends_with('-') {
-            return Err(StoreError::InvalidSlug(
-                "slug must not start or end with `-`".to_owned(),
-            ));
-        }
-        if !raw
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        {
-            return Err(StoreError::InvalidSlug(
-                "slug must use lowercase ascii letters, digits, and `-` only".to_owned(),
-            ));
-        }
-        if raw.split('-').any(str::is_empty) {
-            return Err(StoreError::InvalidSlug(
-                "slug must not contain empty `-` segments".to_owned(),
-            ));
-        }
+        validate_segment_shape(&raw)
+            .map_err(|reason| StoreError::InvalidSlug(format!("slug {reason}")))?;
         Ok(Self(raw))
     }
 
@@ -109,6 +111,40 @@ impl IssueSlug {
 }
 
 impl std::fmt::Display for IssueSlug {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// An epic is nothing but its subdirectory name: `issues/<category>/<epic>/<slug>.md`.
+/// It carries no metadata of its own and exists only while it contains an issue.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+pub(crate) struct Epic(String);
+
+impl Epic {
+    pub(crate) fn parse(raw: impl Into<String>) -> Result<Self, StoreError> {
+        let raw = raw.into();
+        validate_segment_shape(&raw)
+            .map_err(|reason| StoreError::InvalidEpic(format!("epic {reason}")))?;
+        Ok(Self(raw))
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+
+    fn from_dir_name(name: &OsStr) -> Result<Self, StoreError> {
+        let name = name.to_str().ok_or_else(|| {
+            StoreError::MalformedIssueEntry(
+                name.to_string_lossy().into_owned(),
+                "epic directory name must be valid UTF-8".to_owned(),
+            )
+        })?;
+        Self::parse(name)
+    }
+}
+
+impl std::fmt::Display for Epic {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(self.as_str())
     }
@@ -189,9 +225,16 @@ impl ProjectLayout {
         self.issues_root.join(category.as_str())
     }
 
-    pub(crate) fn issue_path(&self, key: &IssueKey) -> PathBuf {
-        self.issue_category_root(key.category)
-            .join(format!("{}.md", key.slug))
+    pub(crate) fn epic_dir(&self, category: IssueCategory, epic: &Epic) -> PathBuf {
+        self.issue_category_root(category).join(epic.as_str())
+    }
+
+    pub(crate) fn issue_path(&self, key: &IssueKey, epic: Option<&Epic>) -> PathBuf {
+        let dir = epic.map_or_else(
+            || self.issue_category_root(key.category),
+            |epic| self.epic_dir(key.category, epic),
+        );
+        dir.join(format!("{}.md", key.slug))
     }
 }
 
@@ -203,6 +246,7 @@ pub(crate) struct ProjectStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct IssueSummary {
     pub(crate) key: IssueKey,
+    pub(crate) epic: Option<Epic>,
     pub(crate) path: PathBuf,
     pub(crate) updated_at: OffsetDateTime,
 }
@@ -210,17 +254,42 @@ pub(crate) struct IssueSummary {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct IssueRecord {
     pub(crate) key: IssueKey,
+    pub(crate) epic: Option<Epic>,
     pub(crate) body: String,
     pub(crate) path: PathBuf,
     pub(crate) updated_at: OffsetDateTime,
     pub(crate) bytes: usize,
 }
 
+/// What `IssueStore::save` did to reach the target location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum SaveOutcome {
+    /// No issue with this slug existed anywhere in the category.
+    Created,
+    /// An issue already sat at exactly this location; its body was replaced.
+    Updated,
+    /// An issue with this slug existed at a different epic location and was
+    /// relocated here.
+    Moved,
+}
+
+impl SaveOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Updated => "updated",
+            Self::Moved => "moved",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct SaveReceipt {
     pub(crate) key: IssueKey,
+    pub(crate) epic: Option<Epic>,
     pub(crate) path: PathBuf,
-    pub(crate) created: bool,
+    pub(crate) outcome: SaveOutcome,
     pub(crate) updated_at: OffsetDateTime,
     pub(crate) bytes: usize,
 }
@@ -228,6 +297,7 @@ pub(crate) struct SaveReceipt {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct DeleteReceipt {
     pub(crate) key: IssueKey,
+    pub(crate) epic: Option<Epic>,
     pub(crate) path: PathBuf,
     pub(crate) deleted_at: OffsetDateTime,
     pub(crate) bytes: usize,
@@ -255,16 +325,42 @@ impl IssueStore {
         })
     }
 
-    pub(crate) fn save(&self, key: IssueKey, body: IssueBody) -> Result<SaveReceipt, StoreError> {
-        let path = self.layout.issue_path(&key);
-        let created = !path.exists();
+    /// Save `body` under `epic` (or uncategorized, if `None`). A slug is
+    /// unique within its category across every epic: if it already exists
+    /// elsewhere in the category, that file is relocated here and its old
+    /// epic directory is pruned once empty.
+    pub(crate) fn save(
+        &self,
+        key: IssueKey,
+        epic: Option<Epic>,
+        body: IssueBody,
+    ) -> Result<SaveReceipt, StoreError> {
+        let target_path = self.layout.issue_path(&key, epic.as_ref());
+        let existing = self.locate_slug(key.category, &key.slug)?;
+        if let Some(epic) = epic.as_ref() {
+            fs::create_dir_all(self.layout.epic_dir(key.category, epic))?;
+        }
         let body = body.into_inner();
-        fs::write(&path, body.as_bytes())?;
-        let metadata = fs::metadata(&path)?;
+        fs::write(&target_path, body.as_bytes())?;
+
+        let outcome = match existing {
+            None => SaveOutcome::Created,
+            Some((old_path, _)) if old_path == target_path => SaveOutcome::Updated,
+            Some((old_path, old_epic)) => {
+                fs::remove_file(&old_path)?;
+                if let Some(old_epic) = old_epic {
+                    remove_epic_dir_if_empty(&self.layout.epic_dir(key.category, &old_epic))?;
+                }
+                SaveOutcome::Moved
+            }
+        };
+
+        let metadata = fs::metadata(&target_path)?;
         Ok(SaveReceipt {
             key,
-            path,
-            created,
+            epic,
+            path: target_path,
+            outcome,
             updated_at: metadata_modified_at(&metadata.modified()?),
             bytes: body.len(),
         })
@@ -273,38 +369,26 @@ impl IssueStore {
     pub(crate) fn list(&self) -> Result<Vec<IssueSummary>, StoreError> {
         let mut issues = Vec::new();
         for category in IssueCategory::all() {
-            for entry in fs::read_dir(self.layout.issue_category_root(category))? {
-                let entry = entry?;
-                let path = entry.path();
-                let file_type = entry.file_type()?;
-                if !file_type.is_file() {
-                    return Err(StoreError::MalformedIssueEntry(
-                        path.display().to_string(),
-                        "issue category directory may contain only `.md` files".to_owned(),
-                    ));
-                }
-                let key = IssueKey::from_issue_path(&path, category)?;
-                let updated_at = metadata_modified_at(&entry.metadata()?.modified()?);
-                issues.push(IssueSummary {
-                    key,
-                    path,
-                    updated_at,
-                });
-            }
+            collect_category_issues(
+                &self.layout.issue_category_root(category),
+                category,
+                None,
+                &mut issues,
+            )?;
         }
         issues.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(issues)
     }
 
     pub(crate) fn read(&self, key: IssueKey) -> Result<IssueRecord, StoreError> {
-        let path = self.layout.issue_path(&key);
-        if !path.is_file() {
-            return Err(StoreError::IssueNotFound(key.to_string()));
-        }
+        let (path, epic) = self
+            .locate_slug(key.category, &key.slug)?
+            .ok_or_else(|| StoreError::IssueNotFound(key.to_string()))?;
         let body = fs::read_to_string(&path)?;
         let metadata = fs::metadata(&path)?;
         Ok(IssueRecord {
             key,
+            epic,
             bytes: body.len(),
             body,
             path,
@@ -313,20 +397,50 @@ impl IssueStore {
     }
 
     pub(crate) fn delete(&self, key: IssueKey) -> Result<DeleteReceipt, StoreError> {
-        let path = self.layout.issue_path(&key);
-        if !path.is_file() {
-            return Err(StoreError::IssueNotFound(key.to_string()));
-        }
+        let (path, epic) = self
+            .locate_slug(key.category, &key.slug)?
+            .ok_or_else(|| StoreError::IssueNotFound(key.to_string()))?;
         let metadata = fs::metadata(&path)?;
         let bytes = usize::try_from(metadata.len())
             .map_err(|_| StoreError::IssueTooLarge(key.to_string(), metadata.len()))?;
         fs::remove_file(&path)?;
+        if let Some(epic) = &epic {
+            remove_epic_dir_if_empty(&self.layout.epic_dir(key.category, epic))?;
+        }
         Ok(DeleteReceipt {
             key,
+            epic,
             path,
             deleted_at: OffsetDateTime::now_utc(),
             bytes,
         })
+    }
+
+    /// Find an existing issue by slug anywhere in `category`: directly, or
+    /// inside exactly one epic subdirectory. A slug is unique within its
+    /// category, so the first match is the only match.
+    fn locate_slug(
+        &self,
+        category: IssueCategory,
+        slug: &IssueSlug,
+    ) -> Result<Option<(PathBuf, Option<Epic>)>, StoreError> {
+        let root = self.layout.issue_category_root(category);
+        let direct = root.join(format!("{slug}.md"));
+        if direct.is_file() {
+            return Ok(Some((direct, None)));
+        }
+        for entry in fs::read_dir(&root)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let epic = Epic::from_dir_name(&entry.file_name())?;
+            let candidate = entry.path().join(format!("{slug}.md"));
+            if candidate.is_file() {
+                return Ok(Some((candidate, Some(epic))));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -342,6 +456,8 @@ pub(crate) enum StoreError {
     InvalidCategory(String),
     #[error("invalid issue slug: {0}")]
     InvalidSlug(String),
+    #[error("invalid epic: {0}")]
+    InvalidEpic(String),
     #[error("issue body must not be blank")]
     EmptyIssueBody,
     #[error("issue `{0}` does not exist")]
@@ -359,6 +475,56 @@ pub(crate) enum StoreError {
     },
     #[error(transparent)]
     Io(#[from] io::Error),
+}
+
+/// Walk `dir` (a category root, or one epic subdirectory of one) collecting
+/// every issue file. Epics nest exactly one level deep under a category.
+fn collect_category_issues(
+    dir: &Path,
+    category: IssueCategory,
+    epic: Option<&Epic>,
+    out: &mut Vec<IssueSummary>,
+) -> Result<(), StoreError> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            if epic.is_some() {
+                return Err(StoreError::MalformedIssueEntry(
+                    path.display().to_string(),
+                    "epic directories must not nest".to_owned(),
+                ));
+            }
+            let nested_epic = Epic::from_dir_name(&entry.file_name())?;
+            collect_category_issues(&path, category, Some(&nested_epic), out)?;
+            continue;
+        }
+        if !file_type.is_file() {
+            return Err(StoreError::MalformedIssueEntry(
+                path.display().to_string(),
+                "issue category directory may contain only `.md` files and epic subdirectories"
+                    .to_owned(),
+            ));
+        }
+        let key = IssueKey::from_issue_path(&path, category)?;
+        let updated_at = metadata_modified_at(&entry.metadata()?.modified()?);
+        out.push(IssueSummary {
+            key,
+            epic: epic.cloned(),
+            path,
+            updated_at,
+        });
+    }
+    Ok(())
+}
+
+/// Remove `dir` once it holds no more issues; an epic is only its directory.
+fn remove_epic_dir_if_empty(dir: &Path) -> Result<(), StoreError> {
+    if fs::read_dir(dir)?.next().is_none() {
+        fs::remove_dir(dir)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn format_timestamp(timestamp: OffsetDateTime) -> String {

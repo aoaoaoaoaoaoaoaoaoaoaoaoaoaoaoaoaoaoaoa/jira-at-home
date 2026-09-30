@@ -291,7 +291,7 @@ impl HostRuntime {
                     "name": SERVER_NAME,
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Bind the session with project.bind, then use issue.save to park categorized notes in the bound state directory under issues/<category>/<slug>.md. The mandatory closed category set is `feature` or `bug`; issue.read and issue.delete require both category and slug, while issue.list enumerates everything still parked."
+                "instructions": "Bind the session with project.bind, then use issue.save to park categorized notes in the bound state directory under issues/<category>/<slug>.md, optionally inside an epic subdirectory (issues/<category>/<epic>/<slug>.md). The mandatory closed category set is `feature` or `bug`; issue.read and issue.delete require both category and slug and resolve the epic automatically, while issue.list enumerates everything still parked and can filter by epic."
             }))),
             "notifications/initialized" => {
                 if !self.seed_captured() {

@@ -64,7 +64,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "issue.save",
-        description: "Create or overwrite one categorized issue note at `issues/<category>/<slug>.md` under the bound project's external state root.",
+        description: "Create or overwrite one categorized issue note at `issues/<category>/<slug>.md` (or `issues/<category>/<epic>/<slug>.md`) under the bound project's external state root.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::NeverReplay,
     },
@@ -76,7 +76,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "issue.list",
-        description: "List the currently parked issues across the closed category set `feature | bug`. There is no close state; deleting an issue removes its file entirely.",
+        description: "List the currently parked issues across the closed category set `feature | bug`, optionally filtered by epic; also names every existing epic. There is no close state; deleting an issue removes its file entirely.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::Convergent,
     },
@@ -138,7 +138,16 @@ fn tool_schema(name: &str) -> Value {
         })),
         "issue.delete" => issue_key_schema("Issue slug to delete within the selected category."),
         "issue.read" => issue_key_schema("Issue slug to read within the selected category."),
-        "issue.list" | "system.health" | "system.telemetry" => with_common_presentation(json!({
+        "issue.list" => with_common_presentation(json!({
+            "type": "object",
+            "properties": {
+                "epic": {
+                    "type": "string",
+                    "description": "Filter by epic. Omit for everything; \"\" for issues with no epic; an epic name for that epic only."
+                }
+            }
+        })),
+        "system.health" | "system.telemetry" => with_common_presentation(json!({
             "type": "object",
             "properties": {}
         })),
@@ -148,7 +157,14 @@ fn tool_schema(name: &str) -> Value {
 
 fn issue_save_properties() -> Map<String, Value> {
     let mut properties = issue_key_properties(
-        "Stable slug. Stored at `issues/<category>/<slug>.md` under the bound project's external state root.",
+        "Stable slug, unique within its category across every epic. Stored at `issues/<category>/<slug>.md`, or under the epic subdirectory when `epic` is set.",
+    );
+    let _ = properties.insert(
+        "epic".to_owned(),
+        json!({
+            "type": "string",
+            "description": "Optional epic subdirectory (same shape rules as slug). Saving an existing slug under a different epic moves it there."
+        }),
     );
     let _ = properties.insert(
         "body".to_owned(),

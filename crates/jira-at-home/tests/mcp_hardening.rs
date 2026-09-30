@@ -833,3 +833,117 @@ fn host_rollout_reexec_preserves_session_and_binding() -> TestResult {
     );
     Ok(())
 }
+
+#[test]
+fn saving_a_slug_under_a_new_epic_relocates_it_and_list_filters_by_epic() -> TestResult {
+    let project_root = temp_project_root("epic_relocation")?;
+    let state_home = project_root.join("state-home");
+    must(fs::create_dir_all(&state_home), "create state home")?;
+    let mut harness = McpHarness::spawn(None, &state_home, &[])?;
+    let _ = harness.initialize()?;
+    harness.notify_initialized()?;
+
+    let bind = harness.bind_project(2, &project_root)?;
+    assert_tool_ok(&bind);
+    let state_root = must_some(
+        tool_content(&bind)["state_root"]
+            .as_str()
+            .map(PathBuf::from),
+        "state root in bind response",
+    )?;
+    let issues_root = state_root.join("issues").join("feature");
+
+    let first_save = harness.call_tool(
+        3,
+        "issue.save",
+        json!({
+            "category": "feature",
+            "slug": "shared-slug",
+            "epic": "alpha",
+            "body": "alpha body",
+        }),
+    )?;
+    assert_tool_ok(&first_save);
+    assert_eq!(
+        tool_content(&first_save)["status"].as_str(),
+        Some("created")
+    );
+    assert!(issues_root.join("alpha").join("shared-slug.md").is_file());
+
+    // Re-saving the same category/slug under a different epic must move the
+    // file (not duplicate it) and prune the now-empty `alpha` directory.
+    let moved_save = harness.call_tool(
+        4,
+        "issue.save",
+        json!({
+            "category": "feature",
+            "slug": "shared-slug",
+            "epic": "beta",
+            "body": "beta body",
+        }),
+    )?;
+    assert_tool_ok(&moved_save);
+    assert_eq!(tool_content(&moved_save)["status"].as_str(), Some("moved"));
+    assert_eq!(tool_content(&moved_save)["epic"].as_str(), Some("beta"));
+    assert!(!issues_root.join("alpha").exists());
+    assert!(issues_root.join("beta").join("shared-slug.md").is_file());
+
+    let plain_save = harness.call_tool(
+        5,
+        "issue.save",
+        json!({
+            "category": "feature",
+            "slug": "plain",
+            "body": "no epic here",
+        }),
+    )?;
+    assert_tool_ok(&plain_save);
+    assert!(tool_content(&plain_save)["epic"].is_null());
+
+    // issue.read resolves the slug without being told which epic it lives in.
+    let read = harness.call_tool(
+        6,
+        "issue.read",
+        json!({ "category": "feature", "slug": "shared-slug" }),
+    )?;
+    assert_tool_ok(&read);
+    assert_eq!(tool_content(&read)["epic"].as_str(), Some("beta"));
+    assert_eq!(tool_content(&read)["body"].as_str(), Some("beta body"));
+
+    let unfiltered = harness.call_tool(7, "issue.list", json!({}))?;
+    assert_tool_ok(&unfiltered);
+    assert_eq!(tool_content(&unfiltered)["count"].as_u64(), Some(2));
+    assert_eq!(tool_content(&unfiltered)["epics"], json!(["beta"]));
+
+    let named_filter = harness.call_tool(8, "issue.list", json!({ "epic": "beta" }))?;
+    assert_tool_ok(&named_filter);
+    assert_eq!(tool_content(&named_filter)["count"].as_u64(), Some(1));
+    assert_eq!(
+        tool_content(&named_filter)["issues"][0]["slug"].as_str(),
+        Some("shared-slug")
+    );
+
+    let no_epic_filter = harness.call_tool(9, "issue.list", json!({ "epic": "" }))?;
+    assert_tool_ok(&no_epic_filter);
+    assert_eq!(tool_content(&no_epic_filter)["count"].as_u64(), Some(1));
+    assert_eq!(
+        tool_content(&no_epic_filter)["issues"][0]["slug"].as_str(),
+        Some("plain")
+    );
+
+    // issue.delete also resolves without an epic argument, and prunes the
+    // epic directory it emptied.
+    let delete = harness.call_tool(
+        10,
+        "issue.delete",
+        json!({ "category": "feature", "slug": "shared-slug" }),
+    )?;
+    assert_tool_ok(&delete);
+    assert!(!issues_root.join("beta").exists());
+
+    let after_delete = harness.call_tool(11, "issue.list", json!({}))?;
+    assert_tool_ok(&after_delete);
+    assert_eq!(tool_content(&after_delete)["count"].as_u64(), Some(1));
+    assert_eq!(tool_content(&after_delete)["epics"], json!([]));
+    Ok(())
+}

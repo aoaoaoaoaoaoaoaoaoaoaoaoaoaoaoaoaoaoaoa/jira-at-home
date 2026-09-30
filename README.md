@@ -6,7 +6,13 @@ It parks Markdown outside the repo:
 
 ```text
 ~/.local/state/jira_at_home/projects/.../issues/<feature|bug>/<slug>.md
+~/.local/state/jira_at_home/projects/.../issues/<feature|bug>/<epic>/<slug>.md
 ```
+
+An epic is only a subdirectory; it holds no metadata beyond its name. A slug
+is unique within its category across every epic — saving an existing slug
+under a different epic (or none) moves the file there and prunes the old
+epic directory once it is empty.
 
 Git-linked worktrees share the same issue namespace via Git's common-dir
 identity; the linked worktree path is only the attachment point.
