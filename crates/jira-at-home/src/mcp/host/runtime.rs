@@ -23,6 +23,7 @@ use crate::mcp::protocol::{
     PROTOCOL_VERSION, ProjectBindingSeed, SERVER_NAME, WorkerOperation, WorkerSpawnConfig,
     write_sync_json_frame,
 };
+use crate::mcp::selection::PageArgs;
 use crate::mcp::telemetry::ServerTelemetry;
 use crate::store::IssueStore;
 
@@ -181,6 +182,12 @@ impl HostRuntime {
         let object = frame.value().as_object()?;
         let id = request_id.as_ref().map(RequestId::to_json_value);
         let params = object.get("params").cloned().unwrap_or_else(|| json!({}));
+        // A valid render survives any later validation or dispatch failure.
+        let error_render = params
+            .pointer("/arguments/render")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok())
+            .unwrap_or_default();
         let operation_key = operation_key(method.as_str(), &params);
         let started_at = Instant::now();
 
@@ -253,7 +260,7 @@ impl HostRuntime {
                     Some(&fault),
                 );
                 id.map(|id| match method.as_str() {
-                    "tools/call" => jsonrpc_result(&id, &fault.into_tool_result()),
+                    "tools/call" => jsonrpc_result(&id, &fault.into_tool_result(error_render)),
                     _ => jsonrpc_error(&id, fault),
                 })
             }
@@ -572,12 +579,17 @@ impl HostRuntime {
                 Ok(tool_success(&output, presentation))
             }
             "system.telemetry" => {
+                let args = deserialize::<TelemetryArgs>(arguments, &operation, generation)?;
                 let worker_alive = self.worker.is_alive();
                 let snapshot = self.telemetry.telemetry_snapshot(worker_alive);
-                let hot_methods = self.telemetry.ranked_methods(worker_alive);
+                let mut hot_methods = self.telemetry.ranked_methods(worker_alive);
+                if let Some(method) = &args.method {
+                    hot_methods.retain(|row| row.method().as_str() == method);
+                }
                 let output = system_telemetry_output(
                     &snapshot,
                     &hot_methods,
+                    &args.page,
                     self.telemetry.host_rollouts(),
                     generation,
                 )?;
@@ -841,8 +853,6 @@ fn project_bind_output(
 ) -> Result<ToolOutput, FaultRecord> {
     let mut concise = Map::new();
     let _ = concise.insert("project_root".to_owned(), json!(status.project_root));
-    let _ = concise.insert("issues_root".to_owned(), json!(status.issues_root));
-    let _ = concise.insert("state_root".to_owned(), json!(status.state_root));
     let _ = concise.insert("issue_count".to_owned(), json!(status.issue_count));
     if status.worktree_root != status.project_root {
         let _ = concise.insert("worktree_root".to_owned(), json!(status.worktree_root));
@@ -850,26 +860,9 @@ fn project_bind_output(
     if status.state_identity != status.project_root {
         let _ = concise.insert("state_identity".to_owned(), json!(status.state_identity));
     }
-    if status.requested_path != status.project_root {
-        let _ = concise.insert("requested_path".to_owned(), json!(status.requested_path));
-    }
-    let mut lines = vec![format!("bound project {}", status.project_root)];
-    if status.worktree_root != status.project_root {
-        lines.push(format!("worktree: {}", status.worktree_root));
-    }
-    if status.state_identity != status.project_root {
-        lines.push(format!("identity: {}", status.state_identity));
-    }
-    lines.extend([
-        format!("issues: {}", status.issues_root),
-        format!("state: {}", status.state_root),
-        format!("issues tracked: {}", status.issue_count),
-    ]);
     fallback_detailed_tool_output(
         &Value::Object(concise),
         status,
-        lines.join("\n"),
-        None,
         libmcp::SurfaceKind::Mutation,
         generation,
         FaultStage::Host,
@@ -927,49 +920,9 @@ fn system_health_output(
         "worker_alive": worker_alive,
         "launch_path_stable": launch_path_stable,
     });
-    let mut lines = vec![format!(
-        "{} | {}",
-        if matches!(health.state, libmcp::LifecycleState::Ready) {
-            "ready"
-        } else {
-            "not-ready"
-        },
-        if binding.is_some() {
-            "bound"
-        } else {
-            "unbound"
-        }
-    )];
-    if let Some(binding) = binding {
-        lines.push(format!("project: {}", binding.project_root.display()));
-        if binding.worktree_root != binding.project_root {
-            lines.push(format!("worktree: {}", binding.worktree_root.display()));
-        }
-        lines.push(format!("issues: {}", binding.issues_root.display()));
-    }
-    lines.push(format!(
-        "worker: gen {} {}",
-        health.generation.get(),
-        if worker_alive { "alive" } else { "dead" }
-    ));
-    lines.push(format!(
-        "binary: {}{}",
-        if launch_path_stable {
-            "stable"
-        } else {
-            "unstable"
-        },
-        if rollout_pending {
-            " rollout-pending"
-        } else {
-            ""
-        }
-    ));
     fallback_detailed_tool_output(
         &Value::Object(concise),
         &full,
-        lines.join("\n"),
-        None,
         libmcp::SurfaceKind::Ops,
         generation,
         FaultStage::Host,
@@ -980,10 +933,11 @@ fn system_health_output(
 fn system_telemetry_output(
     telemetry: &libmcp::TelemetrySnapshot,
     ranked_methods: &[libmcp::MethodTelemetry],
+    args: &PageArgs,
     host_rollouts: u64,
     generation: Generation,
 ) -> Result<ToolOutput, FaultRecord> {
-    let hot_methods = ranked_methods.iter().take(6).collect::<Vec<_>>();
+    let page = args.select(ranked_methods, 6);
     let concise = json!({
         "requests": telemetry.totals.request_count(),
         "successes": telemetry.totals.success_count(),
@@ -994,7 +948,8 @@ fn system_telemetry_output(
         "retries": telemetry.totals.retry_count(),
         "worker_restarts": telemetry.restart_count,
         "host_rollouts": host_rollouts,
-        "hot_methods": hot_methods.iter().map(|method| json!({
+        "method_page": page.metadata(),
+        "hot_methods": page.items.iter().map(|method| json!({
             "method": method.method(),
             "requests": method.request_count(),
             "errors": method.error_count(),
@@ -1005,41 +960,13 @@ fn system_telemetry_output(
         })).collect::<Vec<_>>(),
     });
     let full = json!({
-        "telemetry": telemetry,
+        "telemetry": libmcp::TelemetrySnapshot { methods: page.items.to_vec(), ..telemetry.clone() },
         "host_rollouts": host_rollouts,
+        "method_page": page.metadata(),
     });
-    let mut lines = vec![format!(
-        "requests={} success={} error={} response_error={} recovery_error={} recovery_fault={} retry={}",
-        telemetry.totals.request_count(),
-        telemetry.totals.success_count(),
-        telemetry.totals.error_count(),
-        telemetry.totals.response_error_count(),
-        telemetry.totals.recovery_error_count(),
-        telemetry.totals.recovery_fault_count(),
-        telemetry.totals.retry_count()
-    )];
-    lines.push(format!(
-        "worker_restarts={} host_rollouts={host_rollouts}",
-        telemetry.restart_count,
-    ));
-    if !hot_methods.is_empty() {
-        lines.push("hot methods:".to_owned());
-        for method in hot_methods {
-            lines.push(format!(
-                "{} req={} err={} recovery={} retry={}",
-                method.method(),
-                method.request_count(),
-                method.error_count(),
-                method.recovery_fault_count(),
-                method.retry_count(),
-            ));
-        }
-    }
     fallback_detailed_tool_output(
         &concise,
         &full,
-        lines.join("\n"),
-        None,
         libmcp::SurfaceKind::Ops,
         generation,
         FaultStage::Host,
@@ -1142,6 +1069,13 @@ fn empty_json_object() -> Value {
 #[derive(Debug, serde::Deserialize)]
 struct ProjectBindArgs {
     path: String,
+}
+
+#[derive(serde::Deserialize)]
+struct TelemetryArgs {
+    #[serde(flatten)]
+    page: PageArgs,
+    method: Option<String>,
 }
 
 impl From<&ProjectBinding> for ProjectBindingSeed {

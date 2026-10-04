@@ -1,8 +1,11 @@
 use libmcp::{
-    Fault, FaultClass, FaultCode, Generation, HostRejection, RecoveryHint, ToolErrorDetail,
+    Fault, FaultClass, FaultCode, Generation, HostRejection, RecoveryHint, RenderMode,
+    ToolErrorDetail,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+use crate::mcp::output::tool_result;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) enum FaultStage {
@@ -253,15 +256,19 @@ impl FaultRecord {
         })
     }
 
-    pub(crate) fn into_tool_result(self) -> Value {
-        let rendered_message = self.rendered_message();
-        json!({
-            "content": [{
-                "type": "text",
-                "text": rendered_message,
-            }],
-            "isError": true,
-        })
+    pub(crate) fn into_tool_result(self, render: RenderMode) -> Value {
+        tool_result(
+            &json!({
+                "code": self.fault.code,
+                "class": self.fault.class,
+                "message": self.message(),
+                "operation": self.operation,
+                "retryable": self.retryable,
+                "retried": self.retried,
+            }),
+            render,
+            true,
+        )
     }
 
     fn new(

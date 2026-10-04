@@ -8,3 +8,8 @@ description: >-
 ---
 
 Bind the target project with `project.bind` before issue work unless the MCP was started with `--project`. Use `issue.save` to overwrite `issues/<category>/<slug>.md` under the external state root; `category` is mandatory and must be exactly `feature` or `bug`. Use `issue.list` to enumerate live categorized notes, `issue.read` to recover one note by category and slug, and `issue.delete` to obliterate one note. Treat legacy `issues/*.md` root files as inert migration residue. Reach for `system.health` and `system.telemetry` only when the transport looks suspect.
+
+`issue.list` defaults to 50 selectors; continue with `next_offset` and the same
+filter. `view:"epics"` pages epic names instead. Full detail adds metadata,
+not more rows. `issue.read` always returns the complete body. Porcelain and
+JSON expose the same selected facts; use porcelain for model reading.

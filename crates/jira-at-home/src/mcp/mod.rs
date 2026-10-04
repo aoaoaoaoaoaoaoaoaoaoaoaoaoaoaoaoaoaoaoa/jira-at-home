@@ -3,6 +3,7 @@ mod fault;
 mod host;
 mod output;
 mod protocol;
+mod selection;
 mod service;
 mod telemetry;
 

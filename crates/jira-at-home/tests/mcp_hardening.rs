@@ -81,6 +81,8 @@ impl McpHarness {
             .arg("mcp")
             .arg("serve")
             .env("XDG_STATE_HOME", state_home)
+            // Handoff snapshots belong to this fixture, not the caller's runtime.
+            .env("XDG_RUNTIME_DIR", state_home)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
@@ -266,8 +268,8 @@ fn tool_content(response: &Value) -> &Value {
     &response["result"]["structuredContent"]
 }
 
-fn tool_text(response: &Value) -> &str {
-    response["result"]["content"][0]["text"]
+fn error_message(response: &Value) -> &str {
+    tool_content(response)["message"]
         .as_str()
         .unwrap_or_default()
 }
@@ -526,6 +528,22 @@ fn save_read_delete_roundtrip_through_state_backed_issue_dir() -> TestResult {
         Some("issues/feature/feral-machine.md")
     );
 
+    // Exercise the actual wire boundary: choosing text must neither select
+    // fewer facts nor duplicate the structured payload.
+    let porcelain = harness.request(&json!({
+        "jsonrpc": "2.0", "id": 50, "method": "tools/call",
+        "params": {"name": "issue.read", "arguments": {
+            "category": "feature", "slug": "feral-machine", "detail": "full"
+        }}
+    }))?;
+    assert_tool_ok(&porcelain);
+    assert!(porcelain["result"].get("structuredContent").is_none());
+    assert_eq!(read["result"]["content"], json!([]));
+    assert_eq!(
+        porcelain["result"]["content"][0]["text"],
+        json!(libmcp::render_json_porcelain(tool_content(&read)))
+    );
+
     let delete = harness.call_tool_full(
         6,
         "issue.delete",
@@ -560,8 +578,22 @@ fn save_read_delete_roundtrip_through_state_backed_issue_dir() -> TestResult {
         }),
     )?;
     assert_tool_error(&missing);
-    assert!(tool_text(&missing).contains("fault=invalid_input"));
-    assert!(tool_text(&missing).contains("feature/feral-machine"));
+    assert_eq!(tool_content(&missing)["code"], json!("invalid_input"));
+    assert!(error_message(&missing).contains("feature/feral-machine"));
+    assert_eq!(missing["result"]["content"], json!([]));
+    let porcelain_error = harness.call_tool(
+        80,
+        "issue.read",
+        json!({
+            "category":"feature", "slug":"feral-machine", "render":"porcelain"
+        }),
+    )?;
+    assert_tool_error(&porcelain_error);
+    assert!(porcelain_error["result"].get("structuredContent").is_none());
+    assert_eq!(
+        porcelain_error["result"]["content"][0]["text"],
+        json!(libmcp::render_json_porcelain(tool_content(&missing)))
+    );
 
     let telemetry_path = state_root.join("mcp").join("telemetry.jsonl");
     let events = must(
@@ -642,7 +674,7 @@ fn issue_category_is_closed_and_mandatory() -> TestResult {
         }),
     )?;
     assert_tool_error(&missing_category);
-    assert!(tool_text(&missing_category).contains("missing field `category`"));
+    assert!(error_message(&missing_category).contains("missing field `category`"));
 
     let invalid_category = harness.call_tool(
         4,
@@ -654,7 +686,7 @@ fn issue_category_is_closed_and_mandatory() -> TestResult {
         }),
     )?;
     assert_tool_error(&invalid_category);
-    assert!(tool_text(&invalid_category).contains("expected `feature` or `bug`"));
+    assert!(error_message(&invalid_category).contains("expected `feature` or `bug`"));
     Ok(())
 }
 
@@ -738,7 +770,7 @@ fn uncertain_issue_save_is_never_replayed() -> TestResult {
         }),
     )?;
     assert_tool_error(&save);
-    assert!(tool_text(&save).contains("fault=ambiguous_outcome"));
+    assert_eq!(tool_content(&save)["code"], json!("ambiguous_outcome"));
 
     let telemetry = harness.call_tool_full(4, "system.telemetry", json!({}))?;
     assert_tool_ok(&telemetry);
@@ -910,10 +942,22 @@ fn saving_a_slug_under_a_new_epic_relocates_it_and_list_filters_by_epic() -> Tes
     assert_eq!(tool_content(&read)["epic"].as_str(), Some("beta"));
     assert_eq!(tool_content(&read)["body"].as_str(), Some("beta body"));
 
-    let unfiltered = harness.call_tool(7, "issue.list", json!({}))?;
+    let unfiltered = harness.call_tool(7, "issue.list", json!({"limit":1}))?;
     assert_tool_ok(&unfiltered);
     assert_eq!(tool_content(&unfiltered)["count"].as_u64(), Some(2));
-    assert_eq!(tool_content(&unfiltered)["epics"], json!(["beta"]));
+    assert_eq!(tool_content(&unfiltered)["next_offset"], json!(1));
+    assert_eq!(
+        tool_content(&unfiltered)["issues"].as_array().map(Vec::len),
+        Some(1)
+    );
+    let second = harness.call_tool(70, "issue.list", json!({"limit":1,"offset":1}))?;
+    assert!(tool_content(&second)["next_offset"].is_null());
+    assert_eq!(
+        tool_content(&second)["issues"][0]["slug"],
+        json!("shared-slug")
+    );
+    let epics = harness.call_tool(71, "issue.list", json!({"view":"epics"}))?;
+    assert_eq!(tool_content(&epics)["epics"], json!(["beta"]));
 
     let named_filter = harness.call_tool(8, "issue.list", json!({ "epic": "beta" }))?;
     assert_tool_ok(&named_filter);
@@ -944,6 +988,7 @@ fn saving_a_slug_under_a_new_epic_relocates_it_and_list_filters_by_epic() -> Tes
     let after_delete = harness.call_tool(11, "issue.list", json!({}))?;
     assert_tool_ok(&after_delete);
     assert_eq!(tool_content(&after_delete)["count"].as_u64(), Some(1));
-    assert_eq!(tool_content(&after_delete)["epics"], json!([]));
+    let epics = harness.call_tool(12, "issue.list", json!({"view":"epics"}))?;
+    assert_eq!(tool_content(&epics)["epics"], json!([]));
     Ok(())
 }

@@ -58,31 +58,31 @@ impl ToolSpec {
 const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
         name: "project.bind",
-        description: "Bind this MCP session to a project root or a nested path inside one.",
+        description: "Bind to a project root or a nested path. Full detail adds storage metadata.",
         dispatch: DispatchTarget::Host,
         replay: ReplayContract::Convergent,
     },
     ToolSpec {
         name: "issue.save",
-        description: "Create or overwrite one categorized issue note at `issues/<category>/<slug>.md` (or `issues/<category>/<epic>/<slug>.md`) under the bound project's external state root.",
+        description: "Create or overwrite a Markdown issue. Changing its epic moves the existing note.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::NeverReplay,
     },
     ToolSpec {
         name: "issue.delete",
-        description: "Delete one issue note by category and slug from the bound project's external state root.",
+        description: "Delete an issue permanently.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::NeverReplay,
     },
     ToolSpec {
         name: "issue.list",
-        description: "List the currently parked issues across the closed category set `feature | bug`, optionally filtered by epic; also names every existing epic. There is no close state; deleting an issue removes its file entirely.",
+        description: "Page issue selectors or epic names. Full detail adds issue timestamps and paths; neither view includes bodies. Pages reflect current state, not a retained snapshot.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::Convergent,
     },
     ToolSpec {
         name: "issue.read",
-        description: "Read one issue note by category and slug.",
+        description: "Read a complete issue body. Full detail adds path and byte count.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::Convergent,
     },
@@ -94,7 +94,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "system.telemetry",
-        description: "Read aggregate MCP host telemetry and top hot methods for this session.",
+        description: "Session totals and a page of methods ranked by request count. Full detail adds timings and fault context; it does not expand the page.",
         dispatch: DispatchTarget::Host,
         replay: ReplayContract::Convergent,
     },
@@ -143,27 +143,46 @@ fn tool_schema(name: &str) -> Value {
             "properties": {
                 "epic": {
                     "type": "string",
-                    "description": "Filter by epic. Omit for everything; \"\" for issues with no epic; an epic name for that epic only."
-                }
+                    "description": "Issues only: omit for all, \"\" for no epic, or an exact epic name."
+                },
+                "view": { "type": "string", "enum": ["issues", "epics"], "default": "issues" },
+                "limit": page_limit(50),
+                "offset": page_offset()
             }
         })),
-        "system.health" | "system.telemetry" => with_common_presentation(json!({
+        "system.health" => with_common_presentation(json!({
             "type": "object",
             "properties": {}
+        })),
+        "system.telemetry" => with_common_presentation(json!({
+            "type": "object",
+            "properties": {
+                "method": { "type": "string", "description": "Exact method name; totals remain session-wide." },
+                "limit": page_limit(6),
+                "offset": page_offset()
+            }
         })),
         _ => Value::Null,
     }
 }
 
+fn page_limit(default: usize) -> Value {
+    json!({"type": "integer", "minimum": 1, "maximum": 200, "default": default})
+}
+
+fn page_offset() -> Value {
+    json!({"type": "integer", "minimum": 0, "default": 0,
+        "description": "Continue with next_offset and the same view/filter. Live changes can shift rows."})
+}
+
 fn issue_save_properties() -> Map<String, Value> {
-    let mut properties = issue_key_properties(
-        "Stable slug, unique within its category across every epic. Stored at `issues/<category>/<slug>.md`, or under the epic subdirectory when `epic` is set.",
-    );
+    let mut properties =
+        issue_key_properties("Stable slug, unique within its category across all epics.");
     let _ = properties.insert(
         "epic".to_owned(),
         json!({
             "type": "string",
-            "description": "Optional epic subdirectory (same shape rules as slug). Saving an existing slug under a different epic moves it there."
+            "description": "Epic subdirectory, shaped like a slug. Omit to store without an epic."
         }),
     );
     let _ = properties.insert(

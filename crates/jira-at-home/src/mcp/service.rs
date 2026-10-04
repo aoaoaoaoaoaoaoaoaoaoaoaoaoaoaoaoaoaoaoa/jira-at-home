@@ -10,6 +10,7 @@ use crate::mcp::output::{
     ToolOutput, fallback_detailed_tool_output, split_presentation, tool_success,
 };
 use crate::mcp::protocol::write_sync_json_frame;
+use crate::mcp::selection::PageArgs;
 use crate::store::{
     DeleteReceipt, Epic, IssueBody, IssueCategory, IssueKey, IssueRecord, IssueSlug, IssueStore,
     IssueSummary, SaveReceipt, StoreError, format_timestamp,
@@ -107,24 +108,49 @@ impl WorkerService {
             }
             "issue.list" => {
                 let args = deserialize::<IssueListArgs>(arguments, &operation, self.generation)?;
+                if args.view == ListView::Epics && args.epic.is_some() {
+                    return Err(FaultRecord::invalid_input(
+                        self.generation,
+                        FaultStage::Worker,
+                        &operation,
+                        "epic filters issues; omit it with view=epics",
+                    ));
+                }
                 let epic_filter = EpicFilter::parse(args.epic)
                     .map_err(store_fault(self.generation, &operation))?;
                 let all_issues = self
                     .store
                     .list()
                     .map_err(store_fault(self.generation, &operation))?;
-                let epics = distinct_epics(&all_issues);
-                let issues = all_issues
-                    .iter()
-                    .filter(|issue| epic_filter.matches(issue.epic.as_ref()))
-                    .collect::<Vec<_>>();
-                issue_list_output(
-                    &issues,
-                    &epics,
-                    self.store.layout().state_root.as_path(),
-                    self.generation,
-                    &operation,
-                )?
+                match args.view {
+                    ListView::Issues => {
+                        let issues = all_issues
+                            .iter()
+                            .filter(|issue| epic_filter.matches(issue.epic.as_ref()))
+                            .collect::<Vec<_>>();
+                        issue_list_output(
+                            &issues,
+                            &args.page,
+                            self.store.layout().state_root.as_path(),
+                            self.generation,
+                            &operation,
+                        )?
+                    }
+                    ListView::Epics => {
+                        let epics = distinct_epics(&all_issues);
+                        let page = args.page.select(&epics, 50);
+                        let mut selected = page.metadata();
+                        selected["epics"] = json!(page.items);
+                        fallback_detailed_tool_output(
+                            &selected,
+                            &selected,
+                            SurfaceKind::List,
+                            self.generation,
+                            FaultStage::Worker,
+                            &operation,
+                        )?
+                    }
+                }
             }
             "issue.read" => {
                 let args = deserialize::<IssueKeyArgs>(arguments, &operation, self.generation)?;
@@ -169,12 +195,24 @@ struct IssueKeyArgs {
     slug: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct IssueListArgs {
     /// Absent: no filter. Empty string: issues with no epic. Otherwise: that
     /// epic only.
     #[serde(default)]
     epic: Option<String>,
+    #[serde(default)]
+    view: ListView,
+    #[serde(flatten)]
+    page: PageArgs,
+}
+
+#[derive(Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ListView {
+    #[default]
+    Issues,
+    Epics,
 }
 
 fn deserialize<T: for<'de> Deserialize<'de>>(
@@ -306,18 +344,6 @@ fn issue_save_output(
     fallback_detailed_tool_output(
         &concise,
         &full,
-        [
-            format!(
-                "saved issue {}{}",
-                receipt.key,
-                epic_bracket(receipt.epic.as_ref())
-            ),
-            format!("status: {status}"),
-            format!("path: {}", relative_issue_path(&receipt.path, state_root)),
-            format!("updated: {}", format_timestamp(receipt.updated_at)),
-        ]
-        .join("\n"),
-        None,
         SurfaceKind::Mutation,
         generation,
         FaultStage::Worker,
@@ -358,17 +384,6 @@ fn issue_delete_output(
     fallback_detailed_tool_output(
         &concise,
         &full,
-        [
-            format!(
-                "deleted issue {}{}",
-                receipt.key,
-                epic_bracket(receipt.epic.as_ref())
-            ),
-            format!("path: {}", relative_issue_path(&receipt.path, state_root)),
-            format!("deleted: {deleted_at}"),
-        ]
-        .join("\n"),
-        None,
         SurfaceKind::Mutation,
         generation,
         FaultStage::Worker,
@@ -378,22 +393,19 @@ fn issue_delete_output(
 
 fn issue_list_output(
     issues: &[&IssueSummary],
-    epics: &[&Epic],
+    args: &PageArgs,
     state_root: &Path,
     generation: Generation,
     operation: &str,
 ) -> Result<ToolOutput, FaultRecord> {
-    let concise_items = issues
+    let page = args.select(issues, 50);
+    let concise_items = page
+        .items
         .iter()
-        .map(|issue| {
-            issue_key_payload(
-                &issue.key,
-                issue.epic.as_ref(),
-                [("updated_at", json!(format_timestamp(issue.updated_at)))],
-            )
-        })
+        .map(|issue| issue_key_payload(&issue.key, issue.epic.as_ref(), []))
         .collect::<Vec<_>>();
-    let full_items = issues
+    let full_items = page
+        .items
         .iter()
         .map(|issue| {
             issue_key_payload(
@@ -406,21 +418,13 @@ fn issue_list_output(
             )
         })
         .collect::<Vec<_>>();
-    let epic_names = epics.iter().map(|epic| epic.as_str()).collect::<Vec<_>>();
-    let mut lines = vec![format!("{} issue(s)", issues.len())];
-    lines.extend(
-        issues
-            .iter()
-            .map(|issue| format!("{}{}", issue.key, epic_bracket(issue.epic.as_ref()))),
-    );
-    if !epic_names.is_empty() {
-        lines.push(format!("epics: {}", epic_names.join(", ")));
-    }
+    let mut concise = page.metadata();
+    concise["issues"] = json!(concise_items);
+    let mut full = page.metadata();
+    full["issues"] = json!(full_items);
     fallback_detailed_tool_output(
-        &json!({ "count": issues.len(), "epics": epic_names, "issues": concise_items }),
-        &json!({ "count": issues.len(), "epics": epic_names, "issues": full_items }),
-        lines.join("\n"),
-        None,
+        &concise,
+        &full,
         SurfaceKind::List,
         generation,
         FaultStage::Worker,
@@ -453,27 +457,9 @@ fn issue_read_output(
             ("body", json!(&record.body)),
         ],
     );
-    let concise_text = format!(
-        "issue {}{}\nupdated: {}\n\n{}",
-        record.key,
-        epic_bracket(record.epic.as_ref()),
-        format_timestamp(record.updated_at),
-        record.body,
-    );
-    let full_text = Some(format!(
-        "issue {}{}\npath: {}\nupdated: {}\nbytes: {}\n\n{}",
-        record.key,
-        epic_bracket(record.epic.as_ref()),
-        relative_issue_path(&record.path, state_root),
-        format_timestamp(record.updated_at),
-        record.bytes,
-        record.body,
-    ));
     fallback_detailed_tool_output(
         &concise,
         &full,
-        concise_text,
-        full_text,
         SurfaceKind::Read,
         generation,
         FaultStage::Worker,
@@ -496,11 +482,6 @@ fn issue_key_payload(
             .map(|(field, value)| (field.to_owned(), value)),
     );
     Value::Object(payload)
-}
-
-/// `" [epic]"` when present, else empty — for one-line text renderings.
-fn epic_bracket(epic: Option<&Epic>) -> String {
-    epic.map_or_else(String::new, |epic| format!(" [{epic}]"))
 }
 
 fn relative_issue_path(path: &Path, project_root: &Path) -> String {
