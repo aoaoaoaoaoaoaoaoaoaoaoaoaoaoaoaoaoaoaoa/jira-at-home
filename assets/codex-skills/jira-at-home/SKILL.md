@@ -1,15 +1,33 @@
 ---
 name: jira-at-home
 description: >-
-  Use when you want drooling, braindead per-project issue parking without
-  touching the worktree: bind a project, save a freeform note to the project's
-  state-backed `issues/<feature|bug>/<slug>.md`, list existing issue slugs,
-  read one issue back, or delete one outright.
+  Per-project notebook of bug and feature notes, stored outside the worktree.
+  Use to record a problem or idea for later, find or read existing notes, or
+  delete notes whose work is done. Not a ticket system: notes have no status,
+  assignee, or workflow.
 ---
 
-Bind the target project with `project.bind` before issue work unless the MCP was started with `--project`. Use `issue.save` to overwrite `issues/<category>/<slug>.md` under the external state root; `category` is mandatory and must be exactly `feature` or `bug`. Use `issue.list` to enumerate live categorized notes, `issue.read` to recover one note by category and slug, and `issue.delete` to obliterate one note. Treat legacy `issues/*.md` root files as inert migration residue. Reach for `system.health` and `system.telemetry` only when the transport looks suspect.
+Bind the project with `project.bind` before other calls, unless the server was
+started with `--project`. Notes live under the server's state root, not in the
+worktree, as `issues/<category>/<slug>.md`, where `category` is `bug` or
+`feature`; an optional epic adds a subdirectory.
 
-`issue.list` defaults to 50 selectors; continue with `next_offset` and the same
-filter. `view:"epics"` pages epic names instead. Full detail adds metadata,
-not more rows. `issue.read` always returns the complete body. Porcelain and
-JSON expose the same selected facts; use porcelain for model reading.
+- `issue.save` creates or overwrites a note; changing its epic moves it.
+- `issue.list` returns 50 selectors per page by default; continue with
+  `next_offset` and the same filter. `view:"epics"` lists epic names instead.
+  Full detail adds metadata, not rows.
+- `issue.read` returns the complete body; `issue.delete` removes a note.
+- Use `system.health` and `system.telemetry` only when the server seems faulty.
+
+Porcelain and JSON carry the same facts; read porcelain. Ignore root-level
+`issues/*.md` files, which are residue of an older layout.
+
+## Writing notes
+
+- List existing slugs first, and update a matching note instead of adding another.
+- Say how the problem is known: reproduced, with the command or input, or
+  inferred from reading code. An unreproduced diagnosis may be wrong.
+- Refer to code by file and symbol; line numbers drift.
+- If the owner deferred the item, say so in the first line.
+- When the work is done, delete the note; when part remains, rewrite the note to
+  that part.
