@@ -1,3 +1,4 @@
-# Project Instructions
+jira_at_home: per-project bug and feature notes, stored outside worktrees
 
-Load and follow `$style-doctrine` before meaningful Rust work.
+## routes
+- Changing MCP output, schemas, serialization, or telemetry → `../mcp_depot/TOKEN_POLICY.md`
