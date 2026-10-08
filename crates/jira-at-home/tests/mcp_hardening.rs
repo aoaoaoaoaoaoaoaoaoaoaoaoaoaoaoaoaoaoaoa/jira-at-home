@@ -11,6 +11,7 @@ use serde as _;
 use serde_json::{Value, json};
 use thiserror as _;
 use time as _;
+use toml as _;
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -990,5 +991,80 @@ fn saving_a_slug_under_a_new_epic_relocates_it_and_list_filters_by_epic() -> Tes
     assert_eq!(tool_content(&after_delete)["count"].as_u64(), Some(1));
     let epics = harness.call_tool(12, "issue.list", json!({"view":"epics"}))?;
     assert_eq!(tool_content(&epics)["epics"], json!([]));
+    Ok(())
+}
+
+fn save_feature(harness: &mut McpHarness, id: u64, slug: &str, body: &str) -> TestResult<Value> {
+    harness.call_tool(
+        id,
+        "issue.save",
+        json!({ "category": "feature", "slug": slug, "body": body }),
+    )
+}
+
+#[test]
+fn front_matter_dependencies_are_validated_and_released_on_delete() -> TestResult {
+    let project_root = temp_project_root("front_matter")?;
+    let state_home = project_root.join("state-home");
+    must(fs::create_dir_all(&state_home), "create state home")?;
+    let mut harness = McpHarness::spawn(None, &state_home, &[])?;
+    let _ = harness.initialize()?;
+    harness.notify_initialized()?;
+    assert_tool_ok(&harness.bind_project(2, &project_root)?);
+
+    let base = save_feature(&mut harness, 3, "base", "+++\neffort = 2\n+++\nfoundation")?;
+    assert_tool_ok(&base);
+    assert_eq!(tool_content(&base)["effort"], json!(2));
+    let top_body = "+++\ndepends_on = [\"feature/base\"]\neffort = 4\n+++\nbuilt on base";
+    let top = save_feature(&mut harness, 4, "top", top_body)?;
+    assert_tool_ok(&top);
+    assert_eq!(tool_content(&top)["dependencies"], json!(1));
+
+    for (id, slug, body) in [
+        (5, "base", "+++\ndepends_on = [\"feature/top\"]\n+++\ncycle"),
+        (
+            6,
+            "orphan",
+            "+++\ndepends_on = [\"feature/missing\"]\n+++\nunknown",
+        ),
+        (
+            7,
+            "itself",
+            "+++\ndepends_on = [\"feature/itself\"]\n+++\nself",
+        ),
+        (8, "odd", "+++\neffort = 3\n+++\noff the ladder"),
+        (9, "typo", "+++\ndepend_on = []\n+++\nunknown key"),
+        (10, "open", "+++\neffort = 1\nno closing fence"),
+    ] {
+        assert_tool_error(&save_feature(&mut harness, id, slug, body)?);
+    }
+
+    let list = harness.call_tool(11, "issue.list", json!({}))?;
+    assert_eq!(tool_content(&list)["count"], json!(2));
+    assert_eq!(tool_content(&list)["issues"][0]["effort"], json!(2));
+    assert_eq!(tool_content(&list)["issues"][1]["dependencies"], json!(1));
+    let read = harness.call_tool(
+        12,
+        "issue.read",
+        json!({ "category": "feature", "slug": "base" }),
+    )?;
+    assert_eq!(tool_content(&read)["dependents"], json!(["feature/top"]));
+
+    // Deleting means done: the dependency leaves the dependent's front matter.
+    let delete = harness.call_tool(
+        13,
+        "issue.delete",
+        json!({ "category": "feature", "slug": "base" }),
+    )?;
+    assert_eq!(tool_content(&delete)["dependents"], json!(["feature/top"]));
+    let released = harness.call_tool(
+        14,
+        "issue.read",
+        json!({ "category": "feature", "slug": "top" }),
+    )?;
+    assert_eq!(
+        tool_content(&released)["body"],
+        json!("+++\neffort = 4\n+++\nbuilt on base")
+    );
     Ok(())
 }

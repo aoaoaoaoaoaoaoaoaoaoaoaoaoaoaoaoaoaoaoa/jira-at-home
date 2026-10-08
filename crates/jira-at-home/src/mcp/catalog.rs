@@ -70,19 +70,19 @@ const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "issue.delete",
-        description: "Delete an issue permanently.",
+        description: "Delete an issue permanently; it leaves every depends_on that listed it.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::NeverReplay,
     },
     ToolSpec {
         name: "issue.list",
-        description: "Page issue selectors or epic names. Full detail adds issue timestamps and paths; neither view includes bodies. Pages reflect current state, not a retained snapshot.",
+        description: "Page issue selectors with effort and dependency count, or epic names. Full detail adds depends_on, timestamps and paths; neither view includes bodies. Pages reflect current state, not a retained snapshot.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::Convergent,
     },
     ToolSpec {
         name: "issue.read",
-        description: "Read a complete issue body. Full detail adds path and byte count.",
+        description: "Read a complete issue body and its dependents. Full detail adds path and byte count.",
         dispatch: DispatchTarget::Worker,
         replay: ReplayContract::Convergent,
     },
@@ -189,7 +189,7 @@ fn issue_save_properties() -> Map<String, Value> {
         "body".to_owned(),
         json!({
             "type": "string",
-            "description": "Freeform issue body. Markdown is fine."
+            "description": "Markdown body. It may open with TOML front matter between +++ lines: depends_on = [\"bug/slug\"] names existing issues to finish first; effort is 1, 2, 4, 8, 16 or 32 units."
         }),
     );
     properties

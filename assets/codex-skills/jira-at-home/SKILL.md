@@ -31,3 +31,30 @@ Porcelain and JSON carry the same facts; read porcelain. Ignore root-level
 - If the owner deferred the item, say so in the first line.
 - When the work is done, delete the note; when part remains, rewrite the note to
   that part.
+
+## Dependencies and effort
+
+A body may open with TOML front matter between `+++` lines:
+
+```text
++++
+depends_on = ["bug/parser-crash"]
+effort = 4
++++
+```
+
+- `depends_on` lists issues, as `category/slug`, that must be done first.
+  Edges carry no label. Deleting a done issue removes it from every list.
+- `issue.save` replaces the whole body: keep the front matter when rewriting.
+- `effort` sizes the remaining work as 1, 2, 4, 8, 16 or 32. Compare scope with
+  these rungs; never convert from duration, because human schedules do not
+  describe agent throughput.
+  - 1: one known change in one place, checked by one targeted command.
+  - 2: a contained change in one module, with a few tests or snapshots.
+  - 4: a slice across a few modules or two crates, after reading and one design
+    decision.
+  - 8: a cross-cutting change landing as several commits.
+  - 16: a feature that adds protocol or UI surface and still has open questions.
+  - 32: a campaign: split it, or run it as a Vauban siege.
+- Unknowns are size: between two rungs, take the larger. Re-size when the
+  remaining work changes.

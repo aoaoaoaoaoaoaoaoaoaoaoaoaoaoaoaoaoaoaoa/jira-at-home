@@ -19,6 +19,7 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
+toml.workspace = true
 
 [dev-dependencies]
 libmcp-testkit = { git = "https://github.com/aoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoaoa/libmcp.git", rev = "7555b42edbbe0d30c007302115a88ea5a5fb639d", package = "libmcp-testkit" }

@@ -1,3 +1,4 @@
+mod front_matter;
 mod mcp;
 mod store;
 

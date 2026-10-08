@@ -292,6 +292,13 @@ fn store_fault(
             | StoreError::InvalidSlug(_)
             | StoreError::InvalidEpic(_)
             | StoreError::EmptyIssueBody
+            | StoreError::InvalidFrontMatter(_)
+            | StoreError::InvalidDependency(_)
+            | StoreError::InvalidEffort(_)
+            | StoreError::DuplicateDependency(_)
+            | StoreError::SelfDependency(_)
+            | StoreError::UnknownDependency(_)
+            | StoreError::DependencyCycle { .. }
             | StoreError::IssueNotFound(_)
             | StoreError::MalformedIssueEntry(_, _)
             | StoreError::MalformedGitIndirection(_, _)
@@ -326,6 +333,8 @@ fn issue_save_output(
             ("status", json!(status)),
             ("path", json!(relative_path)),
             ("updated_at", json!(updated_at)),
+            ("effort", json!(receipt.front.effort)),
+            ("dependencies", json!(receipt.front.depends_on.len())),
         ],
     );
     let full = issue_key_payload(
@@ -339,6 +348,9 @@ fn issue_save_output(
             ),
             ("updated_at", json!(format_timestamp(receipt.updated_at))),
             ("bytes", json!(receipt.bytes)),
+            ("effort", json!(receipt.front.effort)),
+            ("dependencies", json!(receipt.front.depends_on.len())),
+            ("depends_on", key_list(&receipt.front.depends_on)),
         ],
     );
     fallback_detailed_tool_output(
@@ -366,6 +378,7 @@ fn issue_delete_output(
             ("status", json!("deleted")),
             ("path", json!(relative_path)),
             ("deleted_at", json!(deleted_at.clone())),
+            ("dependents", key_list(&receipt.dependents)),
         ],
     );
     let full = issue_key_payload(
@@ -379,6 +392,7 @@ fn issue_delete_output(
             ),
             ("deleted_at", json!(format_timestamp(receipt.deleted_at))),
             ("bytes", json!(receipt.bytes)),
+            ("dependents", key_list(&receipt.dependents)),
         ],
     );
     fallback_detailed_tool_output(
@@ -402,7 +416,16 @@ fn issue_list_output(
     let concise_items = page
         .items
         .iter()
-        .map(|issue| issue_key_payload(&issue.key, issue.epic.as_ref(), []))
+        .map(|issue| {
+            issue_key_payload(
+                &issue.key,
+                issue.epic.as_ref(),
+                [
+                    ("effort", json!(issue.front.effort)),
+                    ("dependencies", json!(issue.front.depends_on.len())),
+                ],
+            )
+        })
         .collect::<Vec<_>>();
     let full_items = page
         .items
@@ -412,6 +435,9 @@ fn issue_list_output(
                 &issue.key,
                 issue.epic.as_ref(),
                 [
+                    ("effort", json!(issue.front.effort)),
+                    ("dependencies", json!(issue.front.depends_on.len())),
+                    ("depends_on", key_list(&issue.front.depends_on)),
                     ("path", json!(relative_issue_path(&issue.path, state_root))),
                     ("updated_at", json!(format_timestamp(issue.updated_at))),
                 ],
@@ -444,6 +470,7 @@ fn issue_read_output(
         record.epic.as_ref(),
         [
             ("updated_at", json!(format_timestamp(record.updated_at))),
+            ("dependents", key_list(&record.dependents)),
             ("body", json!(&record.body)),
         ],
     );
@@ -454,6 +481,7 @@ fn issue_read_output(
             ("path", json!(relative_path)),
             ("updated_at", json!(format_timestamp(record.updated_at))),
             ("bytes", json!(record.bytes)),
+            ("dependents", key_list(&record.dependents)),
             ("body", json!(&record.body)),
         ],
     );
@@ -489,4 +517,9 @@ fn relative_issue_path(path: &Path, project_root: &Path) -> String {
         |_| path.display().to_string(),
         |relative| relative.display().to_string(),
     )
+}
+
+/// Issue keys in the `category/slug` form that front matter uses.
+fn key_list(keys: &[IssueKey]) -> Value {
+    json!(keys.iter().map(ToString::to_string).collect::<Vec<_>>())
 }

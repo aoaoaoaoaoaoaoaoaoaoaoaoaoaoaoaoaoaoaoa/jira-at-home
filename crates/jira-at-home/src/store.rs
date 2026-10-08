@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -7,6 +8,8 @@ use std::time::SystemTime;
 use serde::Serialize;
 use thiserror::Error;
 use time::OffsetDateTime;
+
+use crate::front_matter::FrontMatter;
 
 pub(crate) const ISSUES_DIR_NAME: &str = "issues";
 const APP_STATE_DIR_NAME: &str = "jira_at_home";
@@ -161,6 +164,17 @@ impl IssueKey {
         Self { category, slug }
     }
 
+    /// Parses the `category/slug` form that `Display` writes.
+    pub(crate) fn parse(raw: &str) -> Result<Self, StoreError> {
+        let (category, slug) = raw
+            .split_once('/')
+            .ok_or_else(|| StoreError::InvalidDependency(raw.to_owned()))?;
+        Ok(Self::new(
+            IssueCategory::parse(category)?,
+            IssueSlug::parse(slug)?,
+        ))
+    }
+
     fn from_issue_path(path: &Path, category: IssueCategory) -> Result<Self, StoreError> {
         Ok(Self::new(category, IssueSlug::from_issue_path(path)?))
     }
@@ -172,20 +186,21 @@ impl std::fmt::Display for IssueKey {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct IssueBody(String);
+/// A note as stored: Markdown, optionally opened by validated front matter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct IssueBody {
+    raw: String,
+    front: FrontMatter,
+}
 
 impl IssueBody {
     pub(crate) fn parse(raw: impl Into<String>) -> Result<Self, StoreError> {
         let raw = raw.into();
-        if raw.trim().is_empty() {
+        let (front, body) = FrontMatter::parse(&raw)?;
+        if body.trim().is_empty() {
             return Err(StoreError::EmptyIssueBody);
         }
-        Ok(Self(raw))
-    }
-
-    pub(crate) fn into_inner(self) -> String {
-        self.0
+        Ok(Self { raw, front })
     }
 }
 
@@ -249,6 +264,7 @@ pub(crate) struct IssueSummary {
     pub(crate) epic: Option<Epic>,
     pub(crate) path: PathBuf,
     pub(crate) updated_at: OffsetDateTime,
+    pub(crate) front: FrontMatter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -259,6 +275,8 @@ pub(crate) struct IssueRecord {
     pub(crate) path: PathBuf,
     pub(crate) updated_at: OffsetDateTime,
     pub(crate) bytes: usize,
+    /// Issues whose front matter lists this one.
+    pub(crate) dependents: Vec<IssueKey>,
 }
 
 /// What `IssueStore::save` did to reach the target location.
@@ -292,6 +310,7 @@ pub(crate) struct SaveReceipt {
     pub(crate) outcome: SaveOutcome,
     pub(crate) updated_at: OffsetDateTime,
     pub(crate) bytes: usize,
+    pub(crate) front: FrontMatter,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -301,6 +320,8 @@ pub(crate) struct DeleteReceipt {
     pub(crate) path: PathBuf,
     pub(crate) deleted_at: OffsetDateTime,
     pub(crate) bytes: usize,
+    /// Issues that listed the deleted one and no longer do.
+    pub(crate) dependents: Vec<IssueKey>,
 }
 
 #[derive(Debug, Clone)]
@@ -335,13 +356,14 @@ impl IssueStore {
         epic: Option<Epic>,
         body: IssueBody,
     ) -> Result<SaveReceipt, StoreError> {
+        self.validate_dependencies(&key, &body.front)?;
         let target_path = self.layout.issue_path(&key, epic.as_ref());
         let existing = self.locate_slug(key.category, &key.slug)?;
         if let Some(epic) = epic.as_ref() {
             fs::create_dir_all(self.layout.epic_dir(key.category, epic))?;
         }
-        let body = body.into_inner();
-        fs::write(&target_path, body.as_bytes())?;
+        let IssueBody { raw, front } = body;
+        fs::write(&target_path, raw.as_bytes())?;
 
         let outcome = match existing {
             None => SaveOutcome::Created,
@@ -362,8 +384,43 @@ impl IssueStore {
             path: target_path,
             outcome,
             updated_at: metadata_modified_at(&metadata.modified()?),
-            bytes: body.len(),
+            bytes: raw.len(),
+            front,
         })
+    }
+
+    /// Dependencies must name other existing issues and must not close a cycle.
+    fn validate_dependencies(&self, key: &IssueKey, front: &FrontMatter) -> Result<(), StoreError> {
+        if front.depends_on.is_empty() {
+            return Ok(());
+        }
+        let issues = self.list()?;
+        let graph = issues
+            .iter()
+            .map(|issue| (&issue.key, issue.front.depends_on.as_slice()))
+            .collect::<BTreeMap<_, _>>();
+        for dependency in &front.depends_on {
+            if dependency == key {
+                return Err(StoreError::SelfDependency(key.to_string()));
+            }
+            if !graph.contains_key(dependency) {
+                return Err(StoreError::UnknownDependency(dependency.to_string()));
+            }
+            let mut pending = vec![dependency];
+            let mut visited = BTreeSet::new();
+            while let Some(current) = pending.pop() {
+                if current == key {
+                    return Err(StoreError::DependencyCycle {
+                        dependency: dependency.to_string(),
+                        issue: key.to_string(),
+                    });
+                }
+                if visited.insert(current) {
+                    pending.extend(graph.get(current).copied().unwrap_or_default());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn list(&self) -> Result<Vec<IssueSummary>, StoreError> {
@@ -386,6 +443,12 @@ impl IssueStore {
             .ok_or_else(|| StoreError::IssueNotFound(key.to_string()))?;
         let body = fs::read_to_string(&path)?;
         let metadata = fs::metadata(&path)?;
+        let dependents = self
+            .list()?
+            .into_iter()
+            .filter(|issue| issue.front.depends_on.contains(&key))
+            .map(|issue| issue.key)
+            .collect();
         Ok(IssueRecord {
             key,
             epic,
@@ -393,9 +456,11 @@ impl IssueStore {
             body,
             path,
             updated_at: metadata_modified_at(&metadata.modified()?),
+            dependents,
         })
     }
 
+    /// Deleting means done: the deleted issue leaves every `depends_on` that listed it.
     pub(crate) fn delete(&self, key: IssueKey) -> Result<DeleteReceipt, StoreError> {
         let (path, epic) = self
             .locate_slug(key.category, &key.slug)?
@@ -407,12 +472,24 @@ impl IssueStore {
         if let Some(epic) = &epic {
             remove_epic_dir_if_empty(&self.layout.epic_dir(key.category, epic))?;
         }
+        let mut dependents = Vec::new();
+        for issue in self.list()? {
+            if !issue.front.depends_on.contains(&key) {
+                continue;
+            }
+            let raw = fs::read_to_string(&issue.path)?;
+            let (mut front, body) = FrontMatter::parse(&raw)?;
+            front.depends_on.retain(|dependency| dependency != &key);
+            fs::write(&issue.path, front.render(body)?)?;
+            dependents.push(issue.key);
+        }
         Ok(DeleteReceipt {
             key,
             epic,
             path,
             deleted_at: OffsetDateTime::now_utc(),
             bytes,
+            dependents,
         })
     }
 
@@ -460,6 +537,20 @@ pub(crate) enum StoreError {
     InvalidEpic(String),
     #[error("issue body must not be blank")]
     EmptyIssueBody,
+    #[error("invalid front matter: {0}")]
+    InvalidFrontMatter(String),
+    #[error("invalid dependency `{0}`; expected `category/slug`")]
+    InvalidDependency(String),
+    #[error("effort must be 1, 2, 4, 8, 16 or 32, not {0}")]
+    InvalidEffort(i64),
+    #[error("dependency `{0}` is listed twice")]
+    DuplicateDependency(String),
+    #[error("issue `{0}` cannot depend on itself")]
+    SelfDependency(String),
+    #[error("dependency `{0}` does not exist")]
+    UnknownDependency(String),
+    #[error("dependency cycle: `{dependency}` already depends on `{issue}`")]
+    DependencyCycle { dependency: String, issue: String },
     #[error("issue `{0}` does not exist")]
     IssueNotFound(String),
     #[error("malformed issue entry `{0}`: {1}")]
@@ -509,11 +600,13 @@ fn collect_category_issues(
         }
         let key = IssueKey::from_issue_path(&path, category)?;
         let updated_at = metadata_modified_at(&entry.metadata()?.modified()?);
+        let front = FrontMatter::read(&fs::read_to_string(&path)?);
         out.push(IssueSummary {
             key,
             epic: epic.cloned(),
             path,
             updated_at,
+            front,
         });
     }
     Ok(())
