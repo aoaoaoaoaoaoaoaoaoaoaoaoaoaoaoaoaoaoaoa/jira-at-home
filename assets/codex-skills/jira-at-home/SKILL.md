@@ -7,9 +7,9 @@ description: >-
   assignee, or workflow.
 ---
 
-Bind the project with `project.bind` before other calls, unless the server was
-started with `--project`. Notes live under the server's state root, not in the
-worktree, as `issues/<category>/<slug>.md`, where `category` is `bug` or
+Calls act on the project containing your working directory; pass `project` to
+reach another. Notes live under the server's state root, not in the worktree,
+as `issues/<category>/<slug>.md`, where `category` is `bug` or
 `feature`; an optional epic adds a subdirectory.
 
 - `issue.save` creates or overwrites a note; changing its epic moves it.

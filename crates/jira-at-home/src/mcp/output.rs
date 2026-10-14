@@ -20,6 +20,12 @@ pub(crate) struct ToolOutput {
 }
 
 impl ToolOutput {
+    pub(crate) fn with_project(mut self, project: &std::path::Path) -> Self {
+        self.concise["project_root"] = json!(project);
+        self.full["project_root"] = json!(project);
+        self
+    }
+
     fn structured(&self, detail: DetailLevel) -> &Value {
         match detail {
             DetailLevel::Concise => &self.concise,

@@ -13,19 +13,15 @@ use crate::mcp::protocol::write_sync_json_frame;
 use crate::mcp::selection::PageArgs;
 use crate::store::{
     DeleteReceipt, Epic, IssueBody, IssueCategory, IssueKey, IssueRecord, IssueSlug, IssueStore,
-    IssueSummary, SaveReceipt, StoreError, format_timestamp,
+    IssueSummary, ProjectLayout, SaveReceipt, StoreError, format_timestamp,
 };
 
-pub(crate) fn run_worker(
-    project_root: PathBuf,
-    generation: u64,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_worker(generation: u64) -> Result<(), Box<dyn std::error::Error>> {
     let generation = Generation::try_new(generation)?;
-    let store = IssueStore::bind(project_root)?;
     let stdin = io::stdin();
     let mut stdin = BufReader::new(stdin.lock());
     let mut stdout = io::stdout().lock();
-    let mut service = WorkerService::new(store, generation);
+    let mut service = WorkerService::new(generation);
 
     while let FrameReadOutcome::Frame(payload) =
         read_frame_blocking(&mut stdin, FrameLimit::DEFAULT)?
@@ -47,13 +43,12 @@ pub(crate) fn run_worker(
 }
 
 struct WorkerService {
-    store: IssueStore,
     generation: Generation,
 }
 
 impl WorkerService {
-    fn new(store: IssueStore, generation: Generation) -> Self {
-        Self { store, generation }
+    fn new(generation: Generation) -> Self {
+        Self { generation }
     }
 
     fn execute(
@@ -71,6 +66,14 @@ impl WorkerService {
         let operation = format!("tools/call:{name}");
         let (presentation, arguments) =
             split_presentation(arguments, &operation, self.generation, FaultStage::Worker)?;
+        let args = deserialize::<ProjectArgs>(arguments, &operation, self.generation)?;
+        let default = std::env::current_dir()
+            .map_err(StoreError::from)
+            .and_then(ProjectLayout::resolve)
+            .map_err(store_fault(self.generation, &operation))?;
+        let store = IssueStore::open(args.project.as_deref().unwrap_or(&default.requested_path))
+            .map_err(store_fault(self.generation, &operation))?;
+        let arguments = Value::Object(args.arguments);
         let output = match name {
             "issue.save" => {
                 let args = deserialize::<IssueSaveArgs>(arguments, &operation, self.generation)?;
@@ -80,13 +83,12 @@ impl WorkerService {
                     parse_epic(args.epic).map_err(store_fault(self.generation, &operation))?;
                 let body = IssueBody::parse(args.body)
                     .map_err(store_fault(self.generation, &operation))?;
-                let receipt = self
-                    .store
+                let receipt = store
                     .save(key, epic, body)
                     .map_err(store_fault(self.generation, &operation))?;
                 issue_save_output(
                     &receipt,
-                    self.store.layout().state_root.as_path(),
+                    store.layout().state_root.as_path(),
                     self.generation,
                     &operation,
                 )?
@@ -95,13 +97,12 @@ impl WorkerService {
                 let args = deserialize::<IssueKeyArgs>(arguments, &operation, self.generation)?;
                 let key = parse_key(args.category, args.slug)
                     .map_err(store_fault(self.generation, &operation))?;
-                let receipt = self
-                    .store
+                let receipt = store
                     .delete(key)
                     .map_err(store_fault(self.generation, &operation))?;
                 issue_delete_output(
                     &receipt,
-                    self.store.layout().state_root.as_path(),
+                    store.layout().state_root.as_path(),
                     self.generation,
                     &operation,
                 )?
@@ -118,8 +119,7 @@ impl WorkerService {
                 }
                 let epic_filter = EpicFilter::parse(args.epic)
                     .map_err(store_fault(self.generation, &operation))?;
-                let all_issues = self
-                    .store
+                let all_issues = store
                     .list()
                     .map_err(store_fault(self.generation, &operation))?;
                 match args.view {
@@ -131,7 +131,7 @@ impl WorkerService {
                         issue_list_output(
                             &issues,
                             &args.page,
-                            self.store.layout().state_root.as_path(),
+                            store.layout().state_root.as_path(),
                             self.generation,
                             &operation,
                         )?
@@ -156,13 +156,12 @@ impl WorkerService {
                 let args = deserialize::<IssueKeyArgs>(arguments, &operation, self.generation)?;
                 let key = parse_key(args.category, args.slug)
                     .map_err(store_fault(self.generation, &operation))?;
-                let record = self
-                    .store
+                let record = store
                     .read(key)
                     .map_err(store_fault(self.generation, &operation))?;
                 issue_read_output(
                     &record,
-                    self.store.layout().state_root.as_path(),
+                    store.layout().state_root.as_path(),
                     self.generation,
                     &operation,
                 )?
@@ -176,8 +175,20 @@ impl WorkerService {
                 ));
             }
         };
+        let output = if store.layout().project_root == default.project_root {
+            output
+        } else {
+            output.with_project(&store.layout().project_root)
+        };
         Ok(tool_success(&output, presentation))
     }
+}
+
+#[derive(Deserialize)]
+struct ProjectArgs {
+    project: Option<PathBuf>,
+    #[serde(flatten)]
+    arguments: Map<String, Value>,
 }
 
 #[derive(Debug, Deserialize)]

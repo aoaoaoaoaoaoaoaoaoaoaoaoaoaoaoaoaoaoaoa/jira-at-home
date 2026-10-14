@@ -36,6 +36,14 @@ fn install_linked_worktree_gitdir(primary: &Path, linked: &Path) -> TestResult {
     must(fs::create_dir_all(&linked_gitdir), "create linked gitdir")?;
     must(fs::create_dir_all(linked), "create linked worktree")?;
     must(
+        fs::write(primary_git.join("HEAD"), "ref: refs/heads/main\n"),
+        "write primary HEAD",
+    )?;
+    must(
+        fs::write(linked_gitdir.join("HEAD"), "ref: refs/heads/linked\n"),
+        "write linked HEAD",
+    )?;
+    must(
         fs::write(linked_gitdir.join("commondir"), "../..\n"),
         "write linked commondir",
     )?;
@@ -88,7 +96,9 @@ impl McpHarness {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         if let Some(project_root) = project_root {
-            let _ = command.arg("--project").arg(project_root);
+            let _ = command.current_dir(project_root);
+        } else {
+            let _ = command.current_dir(must_some(state_home.parent(), "fixture project root")?);
         }
         for (key, value) in extra_env {
             let _ = command.env(key, value);
@@ -130,14 +140,6 @@ impl McpHarness {
             "method": "tools/list",
             "params": {},
         }))
-    }
-
-    fn bind_project(&mut self, id: u64, path: &Path) -> TestResult<Value> {
-        self.call_tool_full(
-            id,
-            "project.bind",
-            json!({ "path": path.display().to_string() }),
-        )
     }
 
     fn call_tool(&mut self, id: u64, name: &str, mut arguments: Value) -> TestResult<Value> {
@@ -294,164 +296,221 @@ fn tool_definition<'a>(response: &'a Value, name: &str) -> TestResult<&'a Value>
 }
 
 #[test]
-fn cold_start_exposes_basic_toolset_and_binding_surface() -> TestResult {
+fn cold_start_uses_cwd_and_isolates_explicit_projects() -> TestResult {
     let project_root = temp_project_root("cold_start")?;
+    let other_root = temp_project_root("other_project")?;
     let state_home = project_root.join("state-home");
     must(fs::create_dir_all(&state_home), "create state home")?;
-
-    let mut harness = McpHarness::spawn(None, &state_home, &[])?;
-    let initialize = harness.initialize()?;
-    assert_eq!(
-        initialize["result"]["protocolVersion"].as_str(),
-        Some("2025-11-25")
-    );
-    harness.notify_initialized()?;
-
-    let tools = harness.tools_list()?;
-    let tool_names = tool_names(&tools);
-    assert!(tool_names.contains(&"project.bind"));
-    assert!(tool_names.contains(&"issue.save"));
-    assert!(tool_names.contains(&"issue.delete"));
-    assert!(tool_names.contains(&"issue.list"));
-    assert!(tool_names.contains(&"issue.read"));
-    assert!(tool_names.contains(&"system.health"));
-    assert!(tool_names.contains(&"system.telemetry"));
-    let save_schema = &tool_definition(&tools, "issue.save")?["inputSchema"];
-    assert_eq!(
-        save_schema["properties"]["category"]["enum"],
-        json!(["feature", "bug"])
-    );
-    assert!(
-        save_schema["required"]
-            .as_array()
-            .is_some_and(|required| required.contains(&json!("category")))
-    );
-    let read_schema = &tool_definition(&tools, "issue.read")?["inputSchema"];
-    assert!(
-        read_schema["required"]
-            .as_array()
-            .is_some_and(|required| required.contains(&json!("category")))
-    );
-    let delete_schema = &tool_definition(&tools, "issue.delete")?["inputSchema"];
-    assert!(
-        delete_schema["required"]
-            .as_array()
-            .is_some_and(|required| required.contains(&json!("category")))
-    );
-
-    let health = harness.call_tool(3, "system.health", json!({}))?;
-    assert_tool_ok(&health);
-    assert_eq!(tool_content(&health)["bound"].as_bool(), Some(false));
-
-    let nested = project_root.join("nested").join("deeper");
-    must(fs::create_dir_all(&nested), "create nested path")?;
     must(
         fs::create_dir_all(project_root.join(".git")),
         "create fake git root",
     )?;
-    let bind = harness.bind_project(4, &nested)?;
-    assert_tool_ok(&bind);
-    assert_eq!(
-        tool_content(&bind)["project_root"].as_str(),
-        Some(project_root.display().to_string().as_str())
-    );
-    assert_eq!(tool_content(&bind)["issue_count"].as_u64(), Some(0));
+    must(
+        fs::create_dir_all(other_root.join(".git")),
+        "create override git root",
+    )?;
+    must(
+        fs::write(project_root.join(".git/HEAD"), "ref: refs/heads/main\n"),
+        "write default HEAD",
+    )?;
+    must(
+        fs::write(other_root.join(".git/HEAD"), "ref: refs/heads/main\n"),
+        "write override HEAD",
+    )?;
+    let nested = project_root.join("nested/deeper");
+    let other_nested = other_root.join("nested");
+    must(
+        fs::create_dir_all(&nested),
+        "create default nested directory",
+    )?;
+    must(
+        fs::create_dir_all(&other_nested),
+        "create override nested directory",
+    )?;
+    let marker = other_nested.join("marker");
+    must(fs::write(&marker, ""), "create override nested file")?;
 
-    let rebound_health = harness.call_tool(5, "system.health", json!({}))?;
-    assert_tool_ok(&rebound_health);
-    assert_eq!(tool_content(&rebound_health)["bound"].as_bool(), Some(true));
+    let mut harness = McpHarness::spawn(Some(&nested), &state_home, &[])?;
+    let initialize = harness.initialize()?;
+    assert_eq!(initialize["result"]["protocolVersion"], json!("2025-11-25"));
+    harness.notify_initialized()?;
+    let tools = harness.tools_list()?;
+    assert_eq!(
+        tool_names(&tools),
+        [
+            "issue.save",
+            "issue.delete",
+            "issue.list",
+            "issue.read",
+            "system.health",
+            "system.telemetry"
+        ]
+    );
+    for name in tool_names(&tools) {
+        let tool = tool_definition(&tools, name)?;
+        assert_eq!(
+            tool["_meta"]["io.libmcp/effect"]["state"],
+            json!({"kind":"stateless"})
+        );
+        if name.starts_with("issue.") {
+            assert_eq!(
+                tool["inputSchema"]["properties"]["project"]["type"],
+                json!("string")
+            );
+        }
+    }
+    let health = harness.call_tool(3, "system.health", json!({}))?;
+    assert_tool_ok(&health);
+    assert_eq!(
+        tool_content(&health)["default_project"]["project_root"],
+        json!(project_root.display().to_string())
+    );
+    let empty = harness.call_tool(4, "issue.list", json!({}))?;
+    assert_tool_ok(&empty);
+    assert_eq!(tool_content(&empty)["count"], json!(0));
+    assert!(
+        !tool_content(&empty)
+            .as_object()
+            .is_some_and(|fields| fields.contains_key("project_root"))
+    );
+    assert!(!state_path_for(&state_home, &project_root).exists());
+
+    assert_tool_ok(&harness.call_tool(
+        5,
+        "issue.save",
+        json!({
+            "category":"bug", "slug":"same", "body":"default"
+        }),
+    )?);
+    let save = harness.call_tool(
+        6,
+        "issue.save",
+        json!({
+            "project":marker, "category":"bug", "slug":"same", "body":"override"
+        }),
+    )?;
+    assert_tool_ok(&save);
+    assert_eq!(
+        tool_content(&save)["project_root"],
+        json!(other_root.display().to_string())
+    );
+
+    let read = harness.call_tool_full(
+        7,
+        "issue.read",
+        json!({
+            "project":other_nested, "category":"bug", "slug":"same"
+        }),
+    )?;
+    assert_tool_ok(&read);
+    assert_eq!(tool_content(&read)["body"], json!("override"));
+    assert_eq!(
+        tool_content(&read)["project_root"],
+        json!(other_root.display().to_string())
+    );
+    let porcelain = harness.call_tool(8, "issue.read", json!({
+        "project":other_root.display().to_string(), "category":"bug", "slug":"same", "render":"porcelain", "detail":"full"
+    }))?;
+    assert_tool_ok(&porcelain);
+    assert!(porcelain["result"].get("structuredContent").is_none());
+    assert_eq!(read["result"]["content"], json!([]));
+    assert_eq!(
+        porcelain["result"]["content"][0]["text"],
+        json!(libmcp::render_json_porcelain(tool_content(&read)))
+    );
+
+    let list = harness.call_tool(
+        9,
+        "issue.list",
+        json!({
+            "project":other_root.display().to_string(), "view":"epics"
+        }),
+    )?;
+    assert_tool_ok(&list);
+    assert_eq!(
+        tool_content(&list)["project_root"],
+        json!(other_root.display().to_string())
+    );
+    let delete = harness.call_tool(
+        10,
+        "issue.delete",
+        json!({
+            "project":other_root.display().to_string(), "category":"bug", "slug":"same"
+        }),
+    )?;
+    assert_tool_ok(&delete);
+    assert_eq!(
+        tool_content(&delete)["project_root"],
+        json!(other_root.display().to_string())
+    );
+    let default_read = harness.call_tool(
+        11,
+        "issue.read",
+        json!({
+            "category":"bug", "slug":"same"
+        }),
+    )?;
+    assert_tool_ok(&default_read);
+    assert_eq!(tool_content(&default_read)["body"], json!("default"));
+    let health = harness.call_tool(12, "system.health", json!({}))?;
+    assert_eq!(
+        tool_content(&health)["default_project"]["project_root"],
+        json!(project_root.display().to_string())
+    );
     Ok(())
 }
 
 #[test]
-fn linked_worktree_binding_uses_git_common_dir_identity() -> TestResult {
+fn linked_worktree_calls_use_git_common_dir_identity() -> TestResult {
     let primary_root = temp_project_root("linked_worktree")?;
-    let linked_root = primary_root.join(".worktrees").join("touching-demands");
+    let linked_root = primary_root.join(".worktrees/touching-demands");
     let state_home = primary_root.join("state-home");
     must(fs::create_dir_all(&state_home), "create state home")?;
     install_linked_worktree_gitdir(&primary_root, &linked_root)?;
-    let legacy_issue_path = state_path_for(&state_home, &linked_root)
-        .join("issues")
-        .join("feature")
-        .join("legacy-worktree.md");
+    let legacy_issue_path =
+        state_path_for(&state_home, &linked_root).join("issues/feature/legacy-worktree.md");
     must_some(legacy_issue_path.parent(), "legacy issue parent")
         .and_then(|parent| must(fs::create_dir_all(parent), "create legacy issue parent"))?;
     must(
         fs::write(&legacy_issue_path, "legacy linked-worktree body"),
-        "write legacy linked-worktree issue",
+        "write legacy issue",
     )?;
 
-    let mut harness = McpHarness::spawn(None, &state_home, &[])?;
+    let mut harness = McpHarness::spawn(Some(&primary_root), &state_home, &[])?;
     let _ = harness.initialize()?;
     harness.notify_initialized()?;
-
-    let primary_bind = harness.bind_project(2, &primary_root)?;
-    assert_tool_ok(&primary_bind);
-    let primary_state_root = must_some(
-        tool_content(&primary_bind)["state_root"]
-            .as_str()
-            .map(PathBuf::from),
-        "primary state root in bind response",
-    )?;
-
-    let save = harness.call_tool(
+    let primary_state_root = state_path_for(&state_home, &primary_root);
+    assert_tool_ok(&harness.call_tool(
         3,
         "issue.save",
         json!({
-            "category": "bug",
-            "slug": "common-dir",
-            "body": "linked worktrees must share the same parked issues",
+            "category":"bug", "slug":"common-dir", "body":"linked worktrees share notes"
         }),
-    )?;
-    assert_tool_ok(&save);
-
-    let linked_bind = harness.bind_project(4, &linked_root)?;
-    assert_tool_ok(&linked_bind);
-    assert_eq!(
-        tool_content(&linked_bind)["project_root"].as_str(),
-        Some(primary_root.display().to_string().as_str())
-    );
-    assert_eq!(
-        tool_content(&linked_bind)["worktree_root"].as_str(),
-        Some(linked_root.display().to_string().as_str())
-    );
-    assert_eq!(
-        tool_content(&linked_bind)["state_root"].as_str(),
-        Some(primary_state_root.display().to_string().as_str())
-    );
-    assert_eq!(tool_content(&linked_bind)["issue_count"].as_u64(), Some(2));
-    assert!(
-        !primary_state_root
-            .display()
-            .to_string()
-            .contains(".worktrees"),
-        "state root should be keyed by git common dir identity, not linked worktree spelling"
-    );
+    )?);
+    let list = harness.call_tool(4, "issue.list", json!({"project":linked_root}))?;
+    assert_tool_ok(&list);
+    assert_eq!(tool_content(&list)["count"], json!(2));
+    assert!(tool_content(&list).get("project_root").is_none());
     assert!(!legacy_issue_path.exists());
     assert_eq!(
         must(
-            fs::read_to_string(
-                primary_state_root
-                    .join("issues")
-                    .join("feature")
-                    .join("legacy-worktree.md"),
-            ),
-            "read migrated legacy issue",
+            fs::read_to_string(primary_state_root.join("issues/feature/legacy-worktree.md")),
+            "read migrated issue"
         )?,
         "legacy linked-worktree body"
     );
-
-    let list = harness.call_tool(5, "issue.list", json!({}))?;
-    assert_tool_ok(&list);
-    assert_eq!(tool_content(&list)["count"].as_u64(), Some(2));
-    let slugs = tool_content(&list)["issues"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|issue| issue["slug"].as_str())
-        .collect::<Vec<_>>();
-    assert!(slugs.contains(&"common-dir"));
-    assert!(slugs.contains(&"legacy-worktree"));
+    let read = harness.call_tool(
+        5,
+        "issue.read",
+        json!({
+            "category":"feature", "slug":"legacy-worktree"
+        }),
+    )?;
+    assert_tool_ok(&read);
+    assert_eq!(
+        tool_content(&read)["body"],
+        json!("legacy linked-worktree body")
+    );
     Ok(())
 }
 
@@ -464,14 +523,7 @@ fn save_read_delete_roundtrip_through_state_backed_issue_dir() -> TestResult {
     let _ = harness.initialize()?;
     harness.notify_initialized()?;
 
-    let bind = harness.bind_project(2, &project_root)?;
-    assert_tool_ok(&bind);
-    let state_root = must_some(
-        tool_content(&bind)["state_root"]
-            .as_str()
-            .map(PathBuf::from),
-        "state root in bind response",
-    )?;
+    let state_root = state_path_for(&state_home, &project_root);
 
     let body = "# Feral Machine\n\nMake note parking brutally small.";
     let save = harness.call_tool(
@@ -623,7 +675,7 @@ fn save_read_delete_roundtrip_through_state_backed_issue_dir() -> TestResult {
 }
 
 #[test]
-fn legacy_uncategorized_issue_files_do_not_poison_binding() -> TestResult {
+fn legacy_uncategorized_issue_files_do_not_poison_listing() -> TestResult {
     let project_root = temp_project_root("legacy_uncategorized")?;
     let state_home = project_root.join("state-home");
     must(fs::create_dir_all(&state_home), "create state home")?;
@@ -631,23 +683,16 @@ fn legacy_uncategorized_issue_files_do_not_poison_binding() -> TestResult {
     let _ = harness.initialize()?;
     harness.notify_initialized()?;
 
-    let bind = harness.bind_project(2, &project_root)?;
-    assert_tool_ok(&bind);
-    let state_root = must_some(
-        tool_content(&bind)["state_root"]
-            .as_str()
-            .map(PathBuf::from),
-        "state root in bind response",
+    let state_root = state_path_for(&state_home, &project_root);
+    must(
+        fs::create_dir_all(state_root.join("issues")),
+        "create legacy issues directory",
     )?;
     let legacy_path = state_root.join("issues").join("legacy-root-file.md");
     must(
         fs::write(&legacy_path, "old uncategorized body"),
         "write legacy root issue",
     )?;
-
-    let rebound = harness.bind_project(3, &project_root)?;
-    assert_tool_ok(&rebound);
-    assert_eq!(tool_content(&rebound)["issue_count"].as_u64(), Some(0));
 
     let list = harness.call_tool(4, "issue.list", json!({}))?;
     assert_tool_ok(&list);
@@ -663,8 +708,6 @@ fn issue_category_is_closed_and_mandatory() -> TestResult {
     let mut harness = McpHarness::spawn(None, &state_home, &[])?;
     let _ = harness.initialize()?;
     harness.notify_initialized()?;
-    let bind = harness.bind_project(2, &project_root)?;
-    assert_tool_ok(&bind);
 
     let missing_category = harness.call_tool(
         3,
@@ -752,14 +795,7 @@ fn uncertain_issue_save_is_never_replayed() -> TestResult {
     let _ = harness.initialize()?;
     harness.notify_initialized()?;
 
-    let bind = harness.bind_project(2, &project_root)?;
-    assert_tool_ok(&bind);
-    let state_root = must_some(
-        tool_content(&bind)["state_root"]
-            .as_str()
-            .map(PathBuf::from),
-        "state root in bind response",
-    )?;
+    let state_root = state_path_for(&state_home, &project_root);
 
     let save = harness.call_tool(
         3,
@@ -812,7 +848,7 @@ fn uncertain_issue_save_is_never_replayed() -> TestResult {
 }
 
 #[test]
-fn host_rollout_reexec_preserves_session_and_binding() -> TestResult {
+fn host_rollout_reexec_preserves_session() -> TestResult {
     let project_root = temp_project_root("rollout")?;
     let state_home = project_root.join("state-home");
     must(fs::create_dir_all(&state_home), "create state home")?;
@@ -844,7 +880,10 @@ fn host_rollout_reexec_preserves_session_and_binding() -> TestResult {
 
     let health = harness.call_tool(4, "system.health", json!({}))?;
     assert_tool_ok(&health);
-    assert_eq!(tool_content(&health)["bound"].as_bool(), Some(true));
+    assert_eq!(
+        tool_content(&health)["default_project"]["project_root"],
+        json!(project_root.display().to_string())
+    );
 
     let read = harness.call_tool(
         5,
@@ -876,14 +915,7 @@ fn saving_a_slug_under_a_new_epic_relocates_it_and_list_filters_by_epic() -> Tes
     let _ = harness.initialize()?;
     harness.notify_initialized()?;
 
-    let bind = harness.bind_project(2, &project_root)?;
-    assert_tool_ok(&bind);
-    let state_root = must_some(
-        tool_content(&bind)["state_root"]
-            .as_str()
-            .map(PathBuf::from),
-        "state root in bind response",
-    )?;
+    let state_root = state_path_for(&state_home, &project_root);
     let issues_root = state_root.join("issues").join("feature");
 
     let first_save = harness.call_tool(
@@ -1010,7 +1042,6 @@ fn front_matter_dependencies_are_validated_and_released_on_delete() -> TestResul
     let mut harness = McpHarness::spawn(None, &state_home, &[])?;
     let _ = harness.initialize()?;
     harness.notify_initialized()?;
-    assert_tool_ok(&harness.bind_project(2, &project_root)?);
 
     let base = save_feature(&mut harness, 3, "base", "+++\neffort = 2\n+++\nfoundation")?;
     assert_tool_ok(&base);

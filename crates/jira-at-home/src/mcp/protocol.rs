@@ -32,21 +32,10 @@ pub(crate) struct HostStateSeed {
     pub(crate) session_kernel: HostSessionKernelSnapshot,
     pub(crate) telemetry: ServerTelemetry,
     pub(crate) next_request_id: u64,
-    pub(crate) binding: Option<ProjectBindingSeed>,
     pub(crate) worker_generation: Generation,
     pub(crate) worker_spawned: bool,
     pub(crate) force_rollout_consumed: bool,
     pub(crate) crash_once_consumed: bool,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(crate) struct ProjectBindingSeed {
-    pub(crate) requested_path: PathBuf,
-    pub(crate) project_root: PathBuf,
-    #[serde(default)]
-    pub(crate) worktree_root: PathBuf,
-    #[serde(default)]
-    pub(crate) state_identity: PathBuf,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]

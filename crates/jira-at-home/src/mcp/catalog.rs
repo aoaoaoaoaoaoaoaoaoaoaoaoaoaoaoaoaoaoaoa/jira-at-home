@@ -20,18 +20,13 @@ pub(crate) struct ToolSpec {
 
 impl ToolSpec {
     fn effect_json(self) -> Value {
-        let state = if self.name == "project.bind" {
-            json!({"kind": "journaled", "key": "project"})
-        } else {
-            json!({"kind": "stateless"})
-        };
         json!({
             "recovery": {"kind": match self.replay {
                 ReplayContract::Convergent => "replay_safe",
                 ReplayContract::ProbeRequired => "probe_required",
                 ReplayContract::NeverReplay => "at_most_once",
             }},
-            "state": state
+            "state": {"kind": "stateless"}
         })
     }
 
@@ -56,12 +51,6 @@ impl ToolSpec {
 }
 
 const TOOL_SPECS: &[ToolSpec] = &[
-    ToolSpec {
-        name: "project.bind",
-        description: "Bind to a project root or a nested path. Full detail adds storage metadata.",
-        dispatch: DispatchTarget::Host,
-        replay: ReplayContract::Convergent,
-    },
     ToolSpec {
         name: "issue.save",
         description: "Create or overwrite a Markdown issue. Changing its epic moves the existing note.",
@@ -88,7 +77,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "system.health",
-        description: "Read MCP host health, binding state, worker generation, and rollout state.",
+        description: "Read MCP host health, default project, worker generation, and rollout state.",
         dispatch: DispatchTarget::Host,
         replay: ReplayContract::Convergent,
     },
@@ -108,10 +97,17 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
     TOOL_SPECS
         .iter()
         .map(|spec| {
+            let mut schema = tool_schema(spec.name);
+            if spec.dispatch == DispatchTarget::Worker {
+                schema["properties"]["project"] = json!({
+                    "type": "string",
+                    "description": "Project root or any path inside it; defaults to the server working directory."
+                });
+            }
             json!({
                 "name": spec.name,
                 "description": spec.description,
-                "inputSchema": tool_schema(spec.name),
+                "inputSchema": schema,
                 "annotations": spec.annotation_json(),
                 "_meta": {"io.libmcp/effect": spec.effect_json()},
             })
@@ -121,16 +117,6 @@ pub(crate) fn tool_definitions() -> Vec<Value> {
 
 fn tool_schema(name: &str) -> Value {
     match name {
-        "project.bind" => with_common_presentation(json!({
-            "type": "object",
-            "properties": {
-                "path": {
-                    "type": "string",
-                    "description": "Project root or any nested path inside the target project."
-                }
-            },
-            "required": ["path"]
-        })),
         "issue.save" => with_common_presentation(json!({
             "type": "object",
             "properties": issue_save_properties(),

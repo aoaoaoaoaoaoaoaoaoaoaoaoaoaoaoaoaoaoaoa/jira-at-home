@@ -1,5 +1,4 @@
 use std::io::{self, Write};
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use libmcp::{
@@ -9,23 +8,21 @@ use libmcp::{
     TelemetryLog, TimedFrameReadOutcome, TimedFrameReader, ToolOutcome,
     load_snapshot_file_from_env, write_snapshot_file,
 };
-use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::mcp::catalog::{DispatchTarget, tool_definitions, tool_spec};
 use crate::mcp::fault::{FaultRecord, FaultStage};
-use crate::mcp::host::process::{ProjectBinding, WorkerSupervisor};
+use crate::mcp::host::process::WorkerSupervisor;
 use crate::mcp::output::{
     ToolOutput, fallback_detailed_tool_output, split_presentation, tool_success,
 };
 use crate::mcp::protocol::{
     CRASH_ONCE_ENV, FORCE_ROLLOUT_ENV, HOST_STATE_ENV, HostRequestId, HostStateSeed,
-    PROTOCOL_VERSION, ProjectBindingSeed, SERVER_NAME, WorkerOperation, WorkerSpawnConfig,
-    write_sync_json_frame,
+    PROTOCOL_VERSION, SERVER_NAME, WorkerOperation, WorkerSpawnConfig, write_sync_json_frame,
 };
 use crate::mcp::selection::PageArgs;
 use crate::mcp::telemetry::ServerTelemetry;
-use crate::store::IssueStore;
+use crate::store::ProjectLayout;
 
 const HOST_SNAPSHOT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const PENDING_CAPACITY: usize = 1;
@@ -35,11 +32,11 @@ const HOST_CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const HOST_HANDOFF_TIMEOUT: Duration = Duration::from_secs(15);
 const HOST_ROLLOUT_RETRY_DELAY: Duration = Duration::from_secs(5);
 
-pub(crate) fn run_host(initial_project: Option<&Path>) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn run_host() -> Result<(), Box<dyn std::error::Error>> {
     let stdin = io::stdin();
     let mut stdin = TimedFrameReader::new(stdin.lock(), FrameLimit::DEFAULT);
     let mut stdout = io::stdout().lock();
-    let mut host = HostRuntime::new(initial_project)?;
+    let mut host = HostRuntime::new()?;
     host.release.admit_successor()?;
 
     loop {
@@ -59,7 +56,7 @@ pub(crate) fn run_host(initial_project: Option<&Path>) -> Result<(), Box<dyn std
 }
 
 struct HostRuntime {
-    binding: Option<ProjectBinding>,
+    default_project: ProjectLayout,
     session_kernel: HostSessionKernel,
     telemetry: ServerTelemetry,
     telemetry_log: Option<TelemetryLog>,
@@ -75,7 +72,7 @@ struct HostRuntime {
 }
 
 impl HostRuntime {
-    fn new(initial_project: Option<&Path>) -> Result<Self, Box<dyn std::error::Error>> {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let executable = std::env::current_exe()?;
         let release = ReleaseRuntime::discover(SERVER_NAME)?;
         let restored = restore_host_state()?;
@@ -106,31 +103,22 @@ impl HostRuntime {
         let crash_once_consumed = restored
             .as_ref()
             .is_some_and(|seed| seed.crash_once_consumed);
-        let binding = if let Some(seed) = restored.as_ref().and_then(|seed| seed.binding.as_ref()) {
-            Some(restore_binding(seed)?)
-        } else if let Some(path) = initial_project {
-            Some(resolve_project_binding(path)?.binding)
+        let default_project = ProjectLayout::resolve(std::env::current_dir()?)?;
+        let telemetry_log = if default_project.state_root.exists() {
+            Some(open_telemetry_log(&default_project)?)
         } else {
             None
         };
-        let telemetry_log = binding.as_ref().map(open_telemetry_log).transpose()?;
 
-        let mut worker = WorkerSupervisor::new(
+        let worker = WorkerSupervisor::new(
             WorkerSpawnConfig {
                 executable: executable.clone(),
             },
             worker_generation,
             worker_spawned,
         );
-        if let Some(worktree_root) = binding
-            .as_ref()
-            .map(|binding| binding.worktree_root.clone())
-        {
-            worker.rebind(worktree_root);
-        }
-
         Ok(Self {
-            binding,
+            default_project,
             session_kernel,
             telemetry,
             telemetry_log,
@@ -298,7 +286,7 @@ impl HostRuntime {
                     "name": SERVER_NAME,
                     "version": env!("CARGO_PKG_VERSION")
                 },
-                "instructions": "Bind the session with project.bind, then use issue.save to park categorized notes in the bound state directory under issues/<category>/<slug>.md, optionally inside an epic subdirectory (issues/<category>/<epic>/<slug>.md). The mandatory closed category set is `feature` or `bug`; issue.read and issue.delete require both category and slug and resolve the epic automatically, while issue.list enumerates everything still parked and can filter by epic."
+                "instructions": "Calls act on the project containing your working directory; pass project to reach another. Use issue.save to park categorized notes in its state directory under issues/<category>/<slug>.md, optionally inside an epic subdirectory (issues/<category>/<epic>/<slug>.md). The mandatory closed category set is `feature` or `bug`; issue.read and issue.delete require both category and slug and resolve the epic automatically, while issue.list enumerates everything still parked and can filter by epic."
             }))),
             "notifications/initialized" => {
                 if !self.seed_captured() {
@@ -364,6 +352,21 @@ impl HostRuntime {
         arguments: Value,
     ) -> Result<Value, FaultRecord> {
         let operation = format!("tools/call:{}", spec.name);
+        let project_root = arguments
+            .get("project")
+            .and_then(Value::as_str)
+            .map(ProjectLayout::resolve)
+            .transpose()
+            .map_err(|error| {
+                FaultRecord::invalid_input(
+                    self.worker.generation(),
+                    FaultStage::Host,
+                    &operation,
+                    error.to_string(),
+                )
+            })?
+            .map(|project| project.project_root)
+            .filter(|root| root != &self.default_project.project_root);
         self.dispatch_worker_operation(
             request_frame,
             &operation,
@@ -373,6 +376,7 @@ impl HostRuntime {
                 arguments,
             },
         )
+        .map_err(|fault| fault.with_project(project_root))
     }
 
     fn dispatch_worker_operation(
@@ -382,8 +386,22 @@ impl HostRuntime {
         replay: ReplayContract,
         worker_operation: WorkerOperation,
     ) -> Result<Value, FaultRecord> {
-        let binding = self.require_bound_project(operation)?;
-        self.worker.rebind(binding.worktree_root.clone());
+        if self.telemetry_log.is_none()
+            && matches!(
+                operation,
+                "tools/call:issue.save" | "tools/call:issue.delete"
+            )
+        {
+            self.telemetry_log =
+                Some(open_telemetry_log(&self.default_project).map_err(|error| {
+                    FaultRecord::internal(
+                        self.worker.generation(),
+                        FaultStage::Host,
+                        operation,
+                        error.to_string(),
+                    )
+                })?);
+        }
 
         if self.should_crash_worker_once(operation) {
             self.worker.arm_crash_once();
@@ -525,35 +543,6 @@ impl HostRuntime {
         let (presentation, arguments) =
             split_presentation(arguments, &operation, generation, FaultStage::Host)?;
         match name {
-            "project.bind" => {
-                let args = deserialize::<ProjectBindArgs>(
-                    arguments,
-                    "tools/call:project.bind",
-                    generation,
-                )?;
-                let resolved = resolve_project_binding(Path::new(&args.path)).map_err(|error| {
-                    FaultRecord::invalid_input(
-                        generation,
-                        FaultStage::Host,
-                        "tools/call:project.bind",
-                        error.to_string(),
-                    )
-                })?;
-                self.worker
-                    .refresh_binding(resolved.binding.worktree_root.clone());
-                self.telemetry_log =
-                    Some(open_telemetry_log(&resolved.binding).map_err(|error| {
-                        FaultRecord::internal(
-                            generation,
-                            FaultStage::Host,
-                            "tools/call:project.bind",
-                            error.to_string(),
-                        )
-                    })?);
-                self.binding = Some(resolved.binding);
-                let output = project_bind_output(&resolved.status, generation)?;
-                Ok(tool_success(&output, presentation))
-            }
             "system.health" => {
                 let rollout = if self
                     .release
@@ -571,7 +560,7 @@ impl HostRuntime {
                 let health = self.telemetry.health_snapshot(rollout, worker_alive);
                 let output = system_health_output(
                     &health,
-                    self.binding.as_ref(),
+                    &self.default_project,
                     worker_alive,
                     self.release.launch_path_stable(),
                     generation,
@@ -614,17 +603,6 @@ impl HostRuntime {
             operation,
             "client must call initialize and notifications/initialized before normal operations",
         ))
-    }
-
-    fn require_bound_project(&self, operation: &str) -> Result<&ProjectBinding, FaultRecord> {
-        self.binding.as_ref().ok_or_else(|| {
-            FaultRecord::unavailable(
-                self.worker.generation(),
-                FaultStage::Host,
-                operation,
-                "project is not bound; call project.bind with the target project root or a nested path inside it",
-            )
-        })
     }
 
     fn session_initialized(&self) -> bool {
@@ -691,7 +669,6 @@ impl HostRuntime {
             session_kernel: self.session_kernel.snapshot(),
             telemetry: self.telemetry.clone(),
             next_request_id: self.next_request_id,
-            binding: self.binding.as_ref().map(ProjectBindingSeed::from),
             worker_generation: self.worker.generation(),
             worker_spawned: self.worker.has_spawned(),
             force_rollout_consumed: self.force_rollout_consumed,
@@ -778,55 +755,6 @@ impl HostRuntime {
     }
 }
 
-struct ResolvedProjectBinding {
-    binding: ProjectBinding,
-    status: ProjectBindStatus,
-}
-
-#[derive(Debug, Serialize)]
-struct ProjectBindStatus {
-    requested_path: String,
-    project_root: String,
-    worktree_root: String,
-    state_identity: String,
-    issues_root: String,
-    state_root: String,
-    issue_count: usize,
-}
-
-fn resolve_project_binding(
-    requested_path: &Path,
-) -> Result<ResolvedProjectBinding, Box<dyn std::error::Error>> {
-    let store = IssueStore::bind(requested_path)?;
-    let layout = store.layout().clone();
-    let status = store.status()?;
-    Ok(ResolvedProjectBinding {
-        binding: ProjectBinding {
-            requested_path: requested_path.to_owned(),
-            project_root: layout.project_root.clone(),
-            worktree_root: layout.worktree_root.clone(),
-            state_identity: layout.state_identity.clone(),
-            issues_root: layout.issues_root.clone(),
-            state_root: layout.state_root.clone(),
-        },
-        status: ProjectBindStatus {
-            requested_path: requested_path.display().to_string(),
-            project_root: layout.project_root.display().to_string(),
-            worktree_root: layout.worktree_root.display().to_string(),
-            state_identity: layout.state_identity.display().to_string(),
-            issues_root: layout.issues_root.display().to_string(),
-            state_root: layout.state_root.display().to_string(),
-            issue_count: status.issue_count,
-        },
-    })
-}
-
-fn restore_binding(
-    seed: &ProjectBindingSeed,
-) -> Result<ProjectBinding, Box<dyn std::error::Error>> {
-    Ok(resolve_project_binding(&seed.requested_path)?.binding)
-}
-
 fn restore_host_state() -> Result<Option<HostStateSeed>, Box<dyn std::error::Error>> {
     Ok(load_snapshot_file_from_env(
         HOST_STATE_ENV,
@@ -834,94 +762,54 @@ fn restore_host_state() -> Result<Option<HostStateSeed>, Box<dyn std::error::Err
     )?)
 }
 
-fn open_telemetry_log(binding: &ProjectBinding) -> io::Result<TelemetryLog> {
+fn open_telemetry_log(project: &ProjectLayout) -> io::Result<TelemetryLog> {
     TelemetryLog::new(
-        binding
+        project
             .state_root
             .join("mcp")
             .join("telemetry.jsonl")
             .as_path(),
-        binding.project_root.as_path(),
+        project.project_root.as_path(),
         1,
         TelemetryFlushPolicy::PageCache,
     )
 }
 
-fn project_bind_output(
-    status: &ProjectBindStatus,
-    generation: Generation,
-) -> Result<ToolOutput, FaultRecord> {
-    let mut concise = Map::new();
-    let _ = concise.insert("project_root".to_owned(), json!(status.project_root));
-    let _ = concise.insert("issue_count".to_owned(), json!(status.issue_count));
-    if status.worktree_root != status.project_root {
-        let _ = concise.insert("worktree_root".to_owned(), json!(status.worktree_root));
-    }
-    if status.state_identity != status.project_root {
-        let _ = concise.insert("state_identity".to_owned(), json!(status.state_identity));
-    }
-    fallback_detailed_tool_output(
-        &Value::Object(concise),
-        status,
-        libmcp::SurfaceKind::Mutation,
-        generation,
-        FaultStage::Host,
-        "tools/call:project.bind",
-    )
-}
-
 fn system_health_output(
     health: &libmcp::HealthSnapshot,
-    binding: Option<&ProjectBinding>,
+    default_project: &ProjectLayout,
     worker_alive: bool,
     launch_path_stable: bool,
     generation: Generation,
 ) -> Result<ToolOutput, FaultRecord> {
-    let rollout_pending = matches!(health.rollout, Some(RolloutState::Pending));
-    let mut concise = Map::new();
-    let _ = concise.insert(
-        "ready".to_owned(),
-        json!(matches!(health.state, libmcp::LifecycleState::Ready)),
+    let mut project = Map::new();
+    let _ = project.insert(
+        "project_root".to_owned(),
+        json!(default_project.project_root),
     );
-    let _ = concise.insert("bound".to_owned(), json!(binding.is_some()));
-    let _ = concise.insert(
-        "worker_generation".to_owned(),
-        json!(health.generation.get()),
-    );
-    let _ = concise.insert("worker_alive".to_owned(), json!(worker_alive));
-    let _ = concise.insert("rollout_pending".to_owned(), json!(rollout_pending));
-    let _ = concise.insert("launch_path_stable".to_owned(), json!(launch_path_stable));
-    if let Some(binding) = binding {
-        let _ = concise.insert(
-            "project_root".to_owned(),
-            json!(binding.project_root.display().to_string()),
+    let _ = project.insert("issues_root".to_owned(), json!(default_project.issues_root));
+    if default_project.worktree_root != default_project.project_root {
+        let _ = project.insert(
+            "worktree_root".to_owned(),
+            json!(default_project.worktree_root),
         );
-        let _ = concise.insert(
-            "issues_root".to_owned(),
-            json!(binding.issues_root.display().to_string()),
-        );
-        if binding.worktree_root != binding.project_root {
-            let _ = concise.insert(
-                "worktree_root".to_owned(),
-                json!(binding.worktree_root.display().to_string()),
-            );
-        }
     }
+    let concise = json!({
+        "ready": matches!(health.state, libmcp::LifecycleState::Ready),
+        "default_project": project,
+        "worker_generation": health.generation.get(),
+        "worker_alive": worker_alive,
+        "rollout_pending": matches!(health.rollout, Some(RolloutState::Pending)),
+        "launch_path_stable": launch_path_stable,
+    });
     let full = json!({
         "health": health,
-        "binding": binding.map(|binding| json!({
-            "requested_path": binding.requested_path.display().to_string(),
-            "project_root": binding.project_root.display().to_string(),
-            "worktree_root": binding.worktree_root.display().to_string(),
-            "state_identity": binding.state_identity.display().to_string(),
-            "issues_root": binding.issues_root.display().to_string(),
-            "state_root": binding.state_root.display().to_string(),
-        })),
+        "default_project": default_project,
         "worker_alive": worker_alive,
         "launch_path_stable": launch_path_stable,
     });
     fallback_detailed_tool_output(
-        &Value::Object(concise),
+        &concise,
         &full,
         libmcp::SurfaceKind::Ops,
         generation,
@@ -1066,25 +954,9 @@ fn empty_json_object() -> Value {
     json!({})
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct ProjectBindArgs {
-    path: String,
-}
-
 #[derive(serde::Deserialize)]
 struct TelemetryArgs {
     #[serde(flatten)]
     page: PageArgs,
     method: Option<String>,
-}
-
-impl From<&ProjectBinding> for ProjectBindingSeed {
-    fn from(value: &ProjectBinding) -> Self {
-        Self {
-            requested_path: value.requested_path.clone(),
-            project_root: value.project_root.clone(),
-            worktree_root: value.worktree_root.clone(),
-            state_identity: value.state_identity.clone(),
-        }
-    }
 }

@@ -215,17 +215,11 @@ pub(crate) struct ProjectLayout {
 }
 
 impl ProjectLayout {
-    pub(crate) fn bind(requested_path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+    pub(crate) fn resolve(requested_path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         let requested_path = requested_path.into();
         let anchor = resolve_project_anchor(&requested_path)?;
-        let state_root = external_state_root(&anchor.state_identity)?;
-        migrate_legacy_worktree_state(&anchor, &state_root)?;
+        let state_root = external_state_path(&anchor.state_identity);
         let issues_root = state_root.join(ISSUES_DIR_NAME);
-        fs::create_dir_all(&issues_root)?;
-        for category in IssueCategory::all() {
-            fs::create_dir_all(issues_root.join(category.as_str()))?;
-        }
-        fs::create_dir_all(state_root.join("mcp"))?;
         Ok(Self {
             requested_path,
             project_root: anchor.project_root,
@@ -251,11 +245,6 @@ impl ProjectLayout {
         );
         dir.join(format!("{}.md", key.slug))
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ProjectStatus {
-    pub(crate) issue_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -330,20 +319,14 @@ pub(crate) struct IssueStore {
 }
 
 impl IssueStore {
-    pub(crate) fn bind(requested_path: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        Ok(Self {
-            layout: ProjectLayout::bind(requested_path)?,
-        })
+    pub(crate) fn open(requested_path: impl Into<PathBuf>) -> Result<Self, StoreError> {
+        let layout = ProjectLayout::resolve(requested_path)?;
+        migrate_legacy_worktree_state(&layout)?;
+        Ok(Self { layout })
     }
 
     pub(crate) fn layout(&self) -> &ProjectLayout {
         &self.layout
-    }
-
-    pub(crate) fn status(&self) -> Result<ProjectStatus, StoreError> {
-        Ok(ProjectStatus {
-            issue_count: self.list()?.len(),
-        })
     }
 
     /// Save `body` under `epic` (or uncategorized, if `None`). A slug is
@@ -359,9 +342,11 @@ impl IssueStore {
         self.validate_dependencies(&key, &body.front)?;
         let target_path = self.layout.issue_path(&key, epic.as_ref());
         let existing = self.locate_slug(key.category, &key.slug)?;
-        if let Some(epic) = epic.as_ref() {
-            fs::create_dir_all(self.layout.epic_dir(key.category, epic))?;
-        }
+        fs::create_dir_all(
+            target_path
+                .parent()
+                .ok_or_else(|| io::Error::other("issue path has no parent directory"))?,
+        )?;
         let IssueBody { raw, front } = body;
         fs::write(&target_path, raw.as_bytes())?;
 
@@ -506,7 +491,12 @@ impl IssueStore {
         if direct.is_file() {
             return Ok(Some((direct, None)));
         }
-        for entry in fs::read_dir(&root)? {
+        let entries = match fs::read_dir(&root) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
             let entry = entry?;
             if !entry.file_type()?.is_dir() {
                 continue;
@@ -576,7 +566,12 @@ fn collect_category_issues(
     epic: Option<&Epic>,
     out: &mut Vec<IssueSummary>,
 ) -> Result<(), StoreError> {
-    for entry in fs::read_dir(dir)? {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
         let entry = entry?;
         let path = entry.path();
         let file_type = entry.file_type()?;
@@ -657,7 +652,7 @@ fn resolve_project_anchor(requested_path: &Path) -> Result<ProjectAnchor, StoreE
 
     for worktree_root in search_root.ancestors() {
         let git_marker = worktree_root.join(".git");
-        if git_marker.exists() {
+        if git_marker.exists() && (!git_marker.is_dir() || git_marker.join("HEAD").is_file()) {
             let identity = resolve_git_identity(&git_marker, worktree_root)?;
             return Ok(ProjectAnchor {
                 project_root: identity.project_root,
@@ -730,7 +725,14 @@ fn resolve_gitdir_file(git_marker: &Path, worktree_root: &Path) -> Result<PathBu
                 "expected `gitdir: <path>`".to_owned(),
             )
         })?;
-    resolve_git_path(worktree_root, gitdir)
+    let target = resolve_git_path(worktree_root, gitdir)?;
+    if !target.join("HEAD").is_file() {
+        return Err(StoreError::MalformedGitIndirection(
+            git_marker.display().to_string(),
+            "gitdir target has no HEAD".to_owned(),
+        ));
+    }
+    Ok(target)
 }
 
 fn resolve_git_path(base: &Path, raw: &str) -> Result<PathBuf, StoreError> {
@@ -741,12 +743,6 @@ fn resolve_git_path(base: &Path, raw: &str) -> Result<PathBuf, StoreError> {
         base.join(path)
     };
     Ok(path.canonicalize()?)
-}
-
-fn external_state_root(project_root: &Path) -> Result<PathBuf, StoreError> {
-    let base = external_state_path(project_root);
-    fs::create_dir_all(&base)?;
-    Ok(base)
 }
 
 fn external_state_path(project_root: &Path) -> PathBuf {
@@ -763,14 +759,12 @@ fn external_state_path(project_root: &Path) -> PathBuf {
     base
 }
 
-fn migrate_legacy_worktree_state(
-    anchor: &ProjectAnchor,
-    canonical_state_root: &Path,
-) -> Result<(), StoreError> {
-    if anchor.worktree_root == anchor.state_identity {
+fn migrate_legacy_worktree_state(layout: &ProjectLayout) -> Result<(), StoreError> {
+    let canonical_state_root = layout.state_root.as_path();
+    if layout.worktree_root == layout.state_identity {
         return Ok(());
     }
-    let legacy_state_root = external_state_path(&anchor.worktree_root);
+    let legacy_state_root = external_state_path(&layout.worktree_root);
     if legacy_state_root == canonical_state_root || !legacy_state_root.exists() {
         return Ok(());
     }

@@ -17,9 +17,14 @@ epic directory once it is empty.
 Git-linked worktrees share the same issue namespace via Git's common-dir
 identity; the linked worktree path is only the attachment point.
 
+Calls act on the project containing your working directory; pass `project` to
+reach another. A project root or any path inside it is accepted. Reads do not
+create an empty notebook; an unknown issue still reports not found. Existing
+linked-worktree notes migrate to the shared namespace on first issue use.
+Responses identify a non-default project; `system.health` reports the default.
+
 Tools:
 
-- `project.bind`
 - `issue.save`
 - `issue.read`
 - `issue.list`
@@ -67,8 +72,6 @@ including for tool errors. `detail: "full"` adds metadata in either encoding.
 - `system.telemetry` pages methods with `limit` (default 6, maximum 200),
   `offset`, and optional exact `method`. Totals remain session-wide.
   Full detail adds timings and fault context without expanding the page.
-- Binding receipts show the canonical project and issue count; full detail
-  adds storage and requested-path metadata.
 
 Version 2 replaces unbounded lists and renderer previews with these selections.
 Full detail never disables pagination; porcelain never clips selected content.
@@ -76,7 +79,7 @@ Full detail never disables pagination; porcelain never clips selected content.
 Run:
 
 ```bash
-cargo run -- mcp serve --project .
+cargo run -- mcp serve
 ```
 
 The checked-in `.mcp-depot.toml` optionally enables eager immutable releases

@@ -1,3 +1,5 @@
+use std::path::{Path, PathBuf};
+
 use libmcp::{
     Fault, FaultClass, FaultCode, Generation, HostRejection, RecoveryHint, RenderMode,
     ToolErrorDetail,
@@ -25,9 +27,16 @@ pub(crate) struct FaultRecord {
     pub(crate) jsonrpc_code: i64,
     pub(crate) retryable: bool,
     pub(crate) retried: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    project_root: Option<Box<Path>>,
 }
 
 impl FaultRecord {
+    pub(crate) fn with_project(mut self, project_root: Option<PathBuf>) -> Self {
+        self.project_root = project_root.map(PathBuf::into_boxed_path);
+        self
+    }
+
     pub(crate) fn parse_error(
         generation: Generation,
         operation: impl Into<String>,
@@ -257,18 +266,18 @@ impl FaultRecord {
     }
 
     pub(crate) fn into_tool_result(self, render: RenderMode) -> Value {
-        tool_result(
-            &json!({
-                "code": self.fault.code,
-                "class": self.fault.class,
-                "message": self.message(),
-                "operation": self.operation,
-                "retryable": self.retryable,
-                "retried": self.retried,
-            }),
-            render,
-            true,
-        )
+        let mut selected = json!({
+            "code": self.fault.code,
+            "class": self.fault.class,
+            "message": self.message(),
+            "operation": self.operation,
+            "retryable": self.retryable,
+            "retried": self.retried,
+        });
+        if let Some(project_root) = self.project_root {
+            selected["project_root"] = json!(project_root);
+        }
+        tool_result(&selected, render, true)
     }
 
     fn new(
@@ -290,6 +299,7 @@ impl FaultRecord {
             operation: operation.into(),
             jsonrpc_code,
             retried: false,
+            project_root: None,
         }
     }
 }

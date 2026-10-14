@@ -1,9 +1,7 @@
 use std::io::{BufReader, BufWriter};
-use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use libmcp::{FrameLimit, FrameReadOutcome, Generation, read_frame_blocking};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::mcp::fault::{FaultRecord, FaultStage};
@@ -12,22 +10,11 @@ use crate::mcp::protocol::{
     WorkerSpawnConfig, write_sync_json_frame,
 };
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub(super) struct ProjectBinding {
-    pub(super) requested_path: PathBuf,
-    pub(super) project_root: PathBuf,
-    pub(super) worktree_root: PathBuf,
-    pub(super) state_identity: PathBuf,
-    pub(super) issues_root: PathBuf,
-    pub(super) state_root: PathBuf,
-}
-
 pub(super) struct WorkerSupervisor {
     config: WorkerSpawnConfig,
     generation: Generation,
     has_spawned: bool,
     crash_before_reply_once: bool,
-    bound_project_root: Option<PathBuf>,
     child: Option<Child>,
     stdin: Option<BufWriter<ChildStdin>>,
     stdout: Option<BufReader<ChildStdout>>,
@@ -44,7 +31,6 @@ impl WorkerSupervisor {
             generation,
             has_spawned,
             crash_before_reply_once: false,
-            bound_project_root: None,
             child: None,
             stdin: None,
             stdout: None,
@@ -57,23 +43,6 @@ impl WorkerSupervisor {
 
     pub(super) fn has_spawned(&self) -> bool {
         self.has_spawned
-    }
-
-    pub(super) fn rebind(&mut self, project_root: PathBuf) {
-        if self
-            .bound_project_root
-            .as_ref()
-            .is_some_and(|current| current == &project_root)
-        {
-            return;
-        }
-        self.kill_current_worker();
-        self.bound_project_root = Some(project_root);
-    }
-
-    pub(super) fn refresh_binding(&mut self, project_root: PathBuf) {
-        self.kill_current_worker();
-        self.bound_project_root = Some(project_root);
     }
 
     pub(super) fn execute(
@@ -184,14 +153,6 @@ impl WorkerSupervisor {
         if self.is_alive() {
             return Ok(());
         }
-        let Some(project_root) = self.bound_project_root.as_ref() else {
-            return Err(FaultRecord::unavailable(
-                self.generation,
-                FaultStage::Host,
-                "worker.spawn",
-                "project is not bound; call project.bind before using issue tools",
-            ));
-        };
         let generation = if self.has_spawned {
             self.generation.next().map_err(|error| {
                 FaultRecord::internal(
@@ -207,8 +168,6 @@ impl WorkerSupervisor {
         let mut child = Command::new(&self.config.executable)
             .arg("mcp")
             .arg("worker")
-            .arg("--project")
-            .arg(project_root)
             .arg("--generation")
             .arg(generation.get().to_string())
             .stdin(Stdio::piped())
