@@ -21,7 +21,8 @@ pub(crate) fn run_worker(generation: u64) -> Result<(), Box<dyn std::error::Erro
     let stdin = io::stdin();
     let mut stdin = BufReader::new(stdin.lock());
     let mut stdout = io::stdout().lock();
-    let mut service = WorkerService::new(generation);
+    let default_project = ProjectLayout::resolve(std::env::current_dir()?)?;
+    let mut service = WorkerService::new(default_project, generation);
 
     while let FrameReadOutcome::Frame(payload) =
         read_frame_blocking(&mut stdin, FrameLimit::DEFAULT)?
@@ -43,12 +44,16 @@ pub(crate) fn run_worker(generation: u64) -> Result<(), Box<dyn std::error::Erro
 }
 
 struct WorkerService {
+    default_project: ProjectLayout,
     generation: Generation,
 }
 
 impl WorkerService {
-    fn new(generation: Generation) -> Self {
-        Self { generation }
+    fn new(default_project: ProjectLayout, generation: Generation) -> Self {
+        Self {
+            default_project,
+            generation,
+        }
     }
 
     fn execute(
@@ -67,12 +72,12 @@ impl WorkerService {
         let (presentation, arguments) =
             split_presentation(arguments, &operation, self.generation, FaultStage::Worker)?;
         let args = deserialize::<ProjectArgs>(arguments, &operation, self.generation)?;
-        let default = std::env::current_dir()
-            .map_err(StoreError::from)
-            .and_then(ProjectLayout::resolve)
+        let default = &self.default_project;
+        let layout = args
+            .project
+            .map_or_else(|| Ok(default.clone()), ProjectLayout::resolve)
             .map_err(store_fault(self.generation, &operation))?;
-        let store = IssueStore::open(args.project.as_deref().unwrap_or(&default.requested_path))
-            .map_err(store_fault(self.generation, &operation))?;
+        let store = IssueStore::open(layout).map_err(store_fault(self.generation, &operation))?;
         let arguments = Value::Object(args.arguments);
         let output = match name {
             "issue.save" => {

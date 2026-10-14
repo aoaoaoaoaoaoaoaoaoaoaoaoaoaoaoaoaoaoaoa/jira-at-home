@@ -648,7 +648,7 @@ fn save_read_delete_roundtrip_through_state_backed_issue_dir() -> TestResult {
         json!(libmcp::render_json_porcelain(tool_content(&missing)))
     );
 
-    let telemetry_path = state_root.join("mcp").join("telemetry.jsonl");
+    let telemetry_path = state_home.join("jira_at_home/mcp/telemetry.jsonl");
     let events = must(
         read_json_lines::<Value>(&telemetry_path),
         "read telemetry log",
@@ -795,8 +795,6 @@ fn uncertain_issue_save_is_never_replayed() -> TestResult {
     let _ = harness.initialize()?;
     harness.notify_initialized()?;
 
-    let state_root = state_path_for(&state_home, &project_root);
-
     let save = harness.call_tool(
         3,
         "issue.save",
@@ -832,7 +830,7 @@ fn uncertain_issue_save_is_never_replayed() -> TestResult {
     );
 
     let events = must(
-        read_json_lines::<Value>(&state_root.join("mcp").join("telemetry.jsonl")),
+        read_json_lines::<Value>(&state_home.join("jira_at_home/mcp/telemetry.jsonl")),
         "read telemetry log",
     )?;
     let save_event = must_some(

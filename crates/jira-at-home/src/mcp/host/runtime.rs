@@ -22,7 +22,7 @@ use crate::mcp::protocol::{
 };
 use crate::mcp::selection::PageArgs;
 use crate::mcp::telemetry::ServerTelemetry;
-use crate::store::ProjectLayout;
+use crate::store::{ProjectLayout, state_base};
 
 const HOST_SNAPSHOT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const PENDING_CAPACITY: usize = 1;
@@ -59,7 +59,7 @@ struct HostRuntime {
     default_project: ProjectLayout,
     session_kernel: HostSessionKernel,
     telemetry: ServerTelemetry,
-    telemetry_log: Option<TelemetryLog>,
+    telemetry_log: TelemetryLog,
     next_request_id: u64,
     worker: WorkerSupervisor,
     release: ReleaseRuntime,
@@ -104,11 +104,7 @@ impl HostRuntime {
             .as_ref()
             .is_some_and(|seed| seed.crash_once_consumed);
         let default_project = ProjectLayout::resolve(std::env::current_dir()?)?;
-        let telemetry_log = if default_project.state_root.exists() {
-            Some(open_telemetry_log(&default_project)?)
-        } else {
-            None
-        };
+        let telemetry_log = open_telemetry_log()?;
 
         let worker = WorkerSupervisor::new(
             WorkerSpawnConfig {
@@ -386,23 +382,6 @@ impl HostRuntime {
         replay: ReplayContract,
         worker_operation: WorkerOperation,
     ) -> Result<Value, FaultRecord> {
-        if self.telemetry_log.is_none()
-            && matches!(
-                operation,
-                "tools/call:issue.save" | "tools/call:issue.delete"
-            )
-        {
-            self.telemetry_log =
-                Some(open_telemetry_log(&self.default_project).map_err(|error| {
-                    FaultRecord::internal(
-                        self.worker.generation(),
-                        FaultStage::Host,
-                        operation,
-                        error.to_string(),
-                    )
-                })?);
-        }
-
         if self.should_crash_worker_once(operation) {
             self.worker.arm_crash_once();
         }
@@ -734,10 +713,7 @@ impl HostRuntime {
         replay_attempts: u8,
         fault: Option<&FaultRecord>,
     ) {
-        let Some(log) = self.telemetry_log.as_mut() else {
-            return;
-        };
-        let result = log.record_tool_completion(
+        let result = self.telemetry_log.record_tool_completion(
             request_id,
             tool_meta,
             latency_ms,
@@ -762,14 +738,11 @@ fn restore_host_state() -> Result<Option<HostStateSeed>, Box<dyn std::error::Err
     )?)
 }
 
-fn open_telemetry_log(project: &ProjectLayout) -> io::Result<TelemetryLog> {
+fn open_telemetry_log() -> io::Result<TelemetryLog> {
+    let base = state_base();
     TelemetryLog::new(
-        project
-            .state_root
-            .join("mcp")
-            .join("telemetry.jsonl")
-            .as_path(),
-        project.project_root.as_path(),
+        &base.join("mcp/telemetry.jsonl"),
+        &base,
         1,
         TelemetryFlushPolicy::PageCache,
     )

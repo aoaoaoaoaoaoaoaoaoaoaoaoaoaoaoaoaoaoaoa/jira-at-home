@@ -319,8 +319,7 @@ pub(crate) struct IssueStore {
 }
 
 impl IssueStore {
-    pub(crate) fn open(requested_path: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        let layout = ProjectLayout::resolve(requested_path)?;
+    pub(crate) fn open(layout: ProjectLayout) -> Result<Self, StoreError> {
         migrate_legacy_worktree_state(&layout)?;
         Ok(Self { layout })
     }
@@ -745,10 +744,14 @@ fn resolve_git_path(base: &Path, raw: &str) -> Result<PathBuf, StoreError> {
     Ok(path.canonicalize()?)
 }
 
+pub(crate) fn state_base() -> PathBuf {
+    dirs::state_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join(APP_STATE_DIR_NAME)
+}
+
 fn external_state_path(project_root: &Path) -> PathBuf {
-    let mut base = dirs::state_dir().unwrap_or_else(std::env::temp_dir);
-    base.push(APP_STATE_DIR_NAME);
-    base.push("projects");
+    let mut base = state_base().join("projects");
     for component in project_root.components() {
         match component {
             Component::Normal(part) => base.push(part),

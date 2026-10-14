@@ -17,9 +17,9 @@ epic directory once it is empty.
 Git-linked worktrees share the same issue namespace via Git's common-dir
 identity; the linked worktree path is only the attachment point.
 
-Calls act on the project containing your working directory; pass `project` to
-reach another. A project root or any path inside it is accepted. Reads do not
-create an empty notebook; an unknown issue still reports not found. Existing
+Calls act on the project containing the server's working directory; pass
+`project` to reach another. A project root or any path inside it is accepted. Reads do not
+create an empty notebook; an unknown issue reports not found. Existing
 linked-worktree notes migrate to the shared namespace on first issue use.
 Responses identify a non-default project; `system.health` reports the default.
 
