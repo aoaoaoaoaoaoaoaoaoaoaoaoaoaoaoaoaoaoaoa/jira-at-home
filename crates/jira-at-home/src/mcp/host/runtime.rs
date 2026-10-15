@@ -8,7 +8,7 @@ use libmcp::{
     TelemetryLog, TimedFrameReadOutcome, TimedFrameReader, ToolOutcome,
     load_snapshot_file_from_env, write_snapshot_file,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::mcp::catalog::{DispatchTarget, tool_definitions, tool_spec};
 use crate::mcp::fault::{FaultRecord, FaultStage};
@@ -22,7 +22,7 @@ use crate::mcp::protocol::{
 };
 use crate::mcp::selection::PageArgs;
 use crate::mcp::telemetry::ServerTelemetry;
-use crate::store::{ProjectLayout, state_base};
+use crate::store::{ProjectLayout, StoreError, state_base};
 
 const HOST_SNAPSHOT_MAX_BYTES: usize = 16 * 1024 * 1024;
 const PENDING_CAPACITY: usize = 1;
@@ -56,7 +56,8 @@ pub(crate) fn run_host() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 struct HostRuntime {
-    default_project: ProjectLayout,
+    /// The working directory's project, or why it has none.
+    default_project: Result<ProjectLayout, String>,
     session_kernel: HostSessionKernel,
     telemetry: ServerTelemetry,
     telemetry_log: TelemetryLog,
@@ -103,7 +104,10 @@ impl HostRuntime {
         let crash_once_consumed = restored
             .as_ref()
             .is_some_and(|seed| seed.crash_once_consumed);
-        let default_project = ProjectLayout::resolve(std::env::current_dir()?)?;
+        let default_project = std::env::current_dir()
+            .map_err(StoreError::from)
+            .and_then(ProjectLayout::resolve)
+            .map_err(|error| format!("working directory: {error}"));
         let telemetry_log = open_telemetry_log()?;
 
         let worker = WorkerSupervisor::new(
@@ -362,7 +366,12 @@ impl HostRuntime {
                 )
             })?
             .map(|project| project.project_root)
-            .filter(|root| root != &self.default_project.project_root);
+            .filter(|root| {
+                !self
+                    .default_project
+                    .as_ref()
+                    .is_ok_and(|default| root == &default.project_root)
+            });
         self.dispatch_worker_operation(
             request_frame,
             &operation,
@@ -750,23 +759,22 @@ fn open_telemetry_log() -> io::Result<TelemetryLog> {
 
 fn system_health_output(
     health: &libmcp::HealthSnapshot,
-    default_project: &ProjectLayout,
+    default_project: &Result<ProjectLayout, String>,
     worker_alive: bool,
     launch_path_stable: bool,
     generation: Generation,
 ) -> Result<ToolOutput, FaultRecord> {
-    let mut project = Map::new();
-    let _ = project.insert(
-        "project_root".to_owned(),
-        json!(default_project.project_root),
-    );
-    let _ = project.insert("issues_root".to_owned(), json!(default_project.issues_root));
-    if default_project.worktree_root != default_project.project_root {
-        let _ = project.insert(
-            "worktree_root".to_owned(),
-            json!(default_project.worktree_root),
-        );
-    }
+    let (project, layout) = match default_project {
+        Ok(layout) => {
+            let mut project =
+                json!({"project_root": layout.project_root, "issues_root": layout.issues_root});
+            if layout.worktree_root != layout.project_root {
+                project["worktree_root"] = json!(layout.worktree_root);
+            }
+            (project, json!(layout))
+        }
+        Err(reason) => (json!({"error": reason}), json!({"error": reason})),
+    };
     let concise = json!({
         "ready": matches!(health.state, libmcp::LifecycleState::Ready),
         "default_project": project,
@@ -777,7 +785,7 @@ fn system_health_output(
     });
     let full = json!({
         "health": health,
-        "default_project": default_project,
+        "default_project": layout,
         "worker_alive": worker_alive,
         "launch_path_stable": launch_path_stable,
     });

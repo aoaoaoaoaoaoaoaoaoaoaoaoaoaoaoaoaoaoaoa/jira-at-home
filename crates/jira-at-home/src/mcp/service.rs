@@ -21,7 +21,10 @@ pub(crate) fn run_worker(generation: u64) -> Result<(), Box<dyn std::error::Erro
     let stdin = io::stdin();
     let mut stdin = BufReader::new(stdin.lock());
     let mut stdout = io::stdout().lock();
-    let default_project = ProjectLayout::resolve(std::env::current_dir()?)?;
+    let default_project = std::env::current_dir()
+        .map_err(StoreError::from)
+        .and_then(ProjectLayout::resolve)
+        .map_err(|error| format!("working directory: {error}"));
     let mut service = WorkerService::new(default_project, generation);
 
     while let FrameReadOutcome::Frame(payload) =
@@ -44,12 +47,13 @@ pub(crate) fn run_worker(generation: u64) -> Result<(), Box<dyn std::error::Erro
 }
 
 struct WorkerService {
-    default_project: ProjectLayout,
+    /// The working directory's project, or why it has none.
+    default_project: Result<ProjectLayout, String>,
     generation: Generation,
 }
 
 impl WorkerService {
-    fn new(default_project: ProjectLayout, generation: Generation) -> Self {
+    fn new(default_project: Result<ProjectLayout, String>, generation: Generation) -> Self {
         Self {
             default_project,
             generation,
@@ -72,11 +76,19 @@ impl WorkerService {
         let (presentation, arguments) =
             split_presentation(arguments, &operation, self.generation, FaultStage::Worker)?;
         let args = deserialize::<ProjectArgs>(arguments, &operation, self.generation)?;
-        let default = &self.default_project;
-        let layout = args
-            .project
-            .map_or_else(|| Ok(default.clone()), ProjectLayout::resolve)
-            .map_err(store_fault(self.generation, &operation))?;
+        let layout = match args.project {
+            Some(path) => {
+                ProjectLayout::resolve(path).map_err(store_fault(self.generation, &operation))?
+            }
+            None => self.default_project.clone().map_err(|reason| {
+                FaultRecord::invalid_input(
+                    self.generation,
+                    FaultStage::Worker,
+                    &operation,
+                    format!("{reason}; pass project"),
+                )
+            })?,
+        };
         let store = IssueStore::open(layout).map_err(store_fault(self.generation, &operation))?;
         let arguments = Value::Object(args.arguments);
         let output = match name {
@@ -180,7 +192,11 @@ impl WorkerService {
                 ));
             }
         };
-        let output = if store.layout().project_root == default.project_root {
+        let output = if self
+            .default_project
+            .as_ref()
+            .is_ok_and(|default| default.project_root == store.layout().project_root)
+        {
             output
         } else {
             output.with_project(&store.layout().project_root)

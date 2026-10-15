@@ -724,14 +724,14 @@ fn resolve_gitdir_file(git_marker: &Path, worktree_root: &Path) -> Result<PathBu
                 "expected `gitdir: <path>`".to_owned(),
             )
         })?;
-    let target = resolve_git_path(worktree_root, gitdir)?;
+    let target = worktree_root.join(gitdir);
     if !target.join("HEAD").is_file() {
         return Err(StoreError::MalformedGitIndirection(
             git_marker.display().to_string(),
             "gitdir target has no HEAD".to_owned(),
         ));
     }
-    Ok(target)
+    Ok(target.canonicalize()?)
 }
 
 fn resolve_git_path(base: &Path, raw: &str) -> Result<PathBuf, StoreError> {
