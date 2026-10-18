@@ -86,7 +86,7 @@ impl McpHarness {
         extra_env: &[(&str, &str)],
     ) -> TestResult<Self> {
         let mut command = Command::new(binary_path());
-        let _ = command
+        command
             .arg("mcp")
             .arg("serve")
             .env("XDG_STATE_HOME", state_home)
@@ -96,12 +96,12 @@ impl McpHarness {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         if let Some(project_root) = project_root {
-            let _ = command.current_dir(project_root);
+            command.current_dir(project_root);
         } else {
-            let _ = command.current_dir(must_some(state_home.parent(), "fixture project root")?);
+            command.current_dir(must_some(state_home.parent(), "fixture project root")?);
         }
         for (key, value) in extra_env {
-            let _ = command.env(key, value);
+            command.env(key, value);
         }
         let mut child = must(command.spawn(), "spawn mcp host")?;
         let stdin = must_some(child.stdin.take(), "host stdin")?;
@@ -144,13 +144,13 @@ impl McpHarness {
 
     fn call_tool(&mut self, id: u64, name: &str, mut arguments: Value) -> TestResult<Value> {
         if let Some(arguments) = arguments.as_object_mut() {
-            let _ = arguments
+            arguments
                 .entry("render".to_owned())
                 .or_insert_with(|| Value::String("json".to_owned()));
         }
         let mut params = serde_json::Map::new();
-        let _ = params.insert("name".to_owned(), Value::String(name.to_owned()));
-        let _ = params.insert("arguments".to_owned(), arguments);
+        params.insert("name".to_owned(), Value::String(name.to_owned()));
+        params.insert("arguments".to_owned(), arguments);
         self.request(&json!({
             "jsonrpc": "2.0",
             "id": id,
@@ -164,8 +164,8 @@ impl McpHarness {
             Value::Object(arguments) => arguments,
             _ => serde_json::Map::new(),
         };
-        let _ = arguments.insert("render".to_owned(), json!("json"));
-        let _ = arguments.insert("detail".to_owned(), json!("full"));
+        arguments.insert("render".to_owned(), json!("json"));
+        arguments.insert("detail".to_owned(), json!("full"));
         self.call_tool(id, name, Value::Object(arguments))
     }
 
@@ -477,7 +477,7 @@ fn linked_worktree_calls_use_git_common_dir_identity() -> TestResult {
     )?;
 
     let mut harness = McpHarness::spawn(Some(&primary_root), &state_home, &[])?;
-    let _ = harness.initialize()?;
+    harness.initialize()?;
     harness.notify_initialized()?;
     let primary_state_root = state_path_for(&state_home, &primary_root);
     assert_tool_ok(&harness.call_tool(
@@ -520,7 +520,7 @@ fn save_read_delete_roundtrip_through_state_backed_issue_dir() -> TestResult {
     let state_home = project_root.join("state-home");
     must(fs::create_dir_all(&state_home), "create state home")?;
     let mut harness = McpHarness::spawn(None, &state_home, &[])?;
-    let _ = harness.initialize()?;
+    harness.initialize()?;
     harness.notify_initialized()?;
 
     let state_root = state_path_for(&state_home, &project_root);
@@ -680,7 +680,7 @@ fn legacy_uncategorized_issue_files_do_not_poison_listing() -> TestResult {
     let state_home = project_root.join("state-home");
     must(fs::create_dir_all(&state_home), "create state home")?;
     let mut harness = McpHarness::spawn(None, &state_home, &[])?;
-    let _ = harness.initialize()?;
+    harness.initialize()?;
     harness.notify_initialized()?;
 
     let state_root = state_path_for(&state_home, &project_root);
@@ -706,7 +706,7 @@ fn issue_category_is_closed_and_mandatory() -> TestResult {
     let state_home = project_root.join("state-home");
     must(fs::create_dir_all(&state_home), "create state home")?;
     let mut harness = McpHarness::spawn(None, &state_home, &[])?;
-    let _ = harness.initialize()?;
+    harness.initialize()?;
     harness.notify_initialized()?;
 
     let missing_category = harness.call_tool(
@@ -747,7 +747,7 @@ fn convergent_issue_list_survives_worker_crash() -> TestResult {
             "tools/call:issue.list",
         )],
     )?;
-    let _ = harness.initialize()?;
+    harness.initialize()?;
     harness.notify_initialized()?;
 
     let save = harness.call_tool(
@@ -792,7 +792,7 @@ fn uncertain_issue_save_is_never_replayed() -> TestResult {
             "tools/call:issue.save",
         )],
     )?;
-    let _ = harness.initialize()?;
+    harness.initialize()?;
     harness.notify_initialized()?;
 
     let save = harness.call_tool(
@@ -858,7 +858,7 @@ fn host_rollout_reexec_preserves_session() -> TestResult {
             "tools/call:issue.list",
         )],
     )?;
-    let _ = harness.initialize()?;
+    harness.initialize()?;
     harness.notify_initialized()?;
 
     let save = harness.call_tool(
@@ -910,7 +910,7 @@ fn saving_a_slug_under_a_new_epic_relocates_it_and_list_filters_by_epic() -> Tes
     let state_home = project_root.join("state-home");
     must(fs::create_dir_all(&state_home), "create state home")?;
     let mut harness = McpHarness::spawn(None, &state_home, &[])?;
-    let _ = harness.initialize()?;
+    harness.initialize()?;
     harness.notify_initialized()?;
 
     let state_root = state_path_for(&state_home, &project_root);
@@ -1038,7 +1038,7 @@ fn front_matter_dependencies_are_validated_and_released_on_delete() -> TestResul
     let state_home = project_root.join("state-home");
     must(fs::create_dir_all(&state_home), "create state home")?;
     let mut harness = McpHarness::spawn(None, &state_home, &[])?;
-    let _ = harness.initialize()?;
+    harness.initialize()?;
     harness.notify_initialized()?;
 
     let base = save_feature(&mut harness, 3, "base", "+++\neffort = 2\n+++\nfoundation")?;

@@ -32,7 +32,9 @@ unsafe_code = "deny"
 unused_crate_dependencies = "deny"
 unused_lifetimes = "deny"
 unused_qualifications = "deny"
-unused_results = "deny"
+# House policy: a discard is a defect only where `#[must_use]` declares an
+# obligation, which `warnings` enforces through `unused_must_use`.
+unused_results = "allow"
 
 # House policy: intentional glob vocabularies save tokens; actual ambiguity
 # remains a name-resolution error.
@@ -50,6 +52,10 @@ bare_urls = "deny"
 broken_intra_doc_links = "deny"
 
 [workspace.lints.clippy]
+# House policy: `#[must_use]` declares an obligation; blanket annotation
+# erases the signal.
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
 all = { level = "deny", priority = -2 }
 pedantic = { level = "deny", priority = -1 }
 cargo = { level = "deny", priority = -3 }

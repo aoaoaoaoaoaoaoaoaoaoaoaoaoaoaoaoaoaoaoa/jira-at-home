@@ -533,9 +533,9 @@ fn issue_key_payload(
     fields: impl IntoIterator<Item = (&'static str, Value)>,
 ) -> Value {
     let mut payload = Map::new();
-    let _ = payload.insert("category".to_owned(), json!(key.category));
-    let _ = payload.insert("slug".to_owned(), json!(&key.slug));
-    let _ = payload.insert("epic".to_owned(), json!(epic));
+    payload.insert("category".to_owned(), json!(key.category));
+    payload.insert("slug".to_owned(), json!(&key.slug));
+    payload.insert("epic".to_owned(), json!(epic));
     payload.extend(
         fields
             .into_iter()

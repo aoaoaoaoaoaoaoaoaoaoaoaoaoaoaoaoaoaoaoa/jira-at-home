@@ -164,14 +164,14 @@ fn page_offset() -> Value {
 fn issue_save_properties() -> Map<String, Value> {
     let mut properties =
         issue_key_properties("Stable slug, unique within its category across all epics.");
-    let _ = properties.insert(
+    properties.insert(
         "epic".to_owned(),
         json!({
             "type": "string",
             "description": "Epic subdirectory, shaped like a slug. Omit to store without an epic."
         }),
     );
-    let _ = properties.insert(
+    properties.insert(
         "body".to_owned(),
         json!({
             "type": "string",
@@ -191,8 +191,8 @@ fn issue_key_schema(slug_description: &'static str) -> Value {
 
 fn issue_key_properties(slug_description: &'static str) -> Map<String, Value> {
     let mut properties = Map::new();
-    let _ = properties.insert("category".to_owned(), issue_category_schema());
-    let _ = properties.insert(
+    properties.insert("category".to_owned(), issue_category_schema());
+    properties.insert(
         "slug".to_owned(),
         json!({
             "type": "string",
